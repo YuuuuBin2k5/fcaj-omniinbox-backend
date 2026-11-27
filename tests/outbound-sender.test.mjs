@@ -24,21 +24,35 @@ function makeOutboundHarness({
   let ssmCalls = 0;
   let fetchUrl = null;
   let convState = { ...conv };
+  let fetchCalls = 0;
+  const messages = new Map(msgToRetry ? [[msgToRetry.messageId, { ...msgToRetry }]] : []);
+  function conflict() {
+    return Object.assign(new Error("Conditional check failed"), { name: "ConditionalCheckFailedException" });
+  }
 
   const ddbClient = {
     async send(cmd) {
       const name = cmd.constructor.name;
       if (name === "GetCommand") {
         if (cmd.input.TableName === "OmniConversations") return { Item: { ...convState } };
-        if (cmd.input.TableName === "OmniMessages") return { Item: msgToRetry };
+        if (cmd.input.TableName === "OmniMessages") return { Item: messages.get(cmd.input.Key.messageId) };
       }
       if (name === "PutCommand") {
+        if (messages.has(cmd.input.Item.messageId)) throw conflict();
+        messages.set(cmd.input.Item.messageId, cmd.input.Item);
         puts.push(cmd.input.Item);
         return {};
       }
       if (name === "UpdateCommand") {
         updates.push(cmd.input);
         const cond = cmd.input.ConditionExpression || "";
+        if (cmd.input.TableName === "OmniMessages") {
+          const msg = messages.get(cmd.input.Key.messageId);
+          const vals = cmd.input.ExpressionAttributeValues;
+          if (msg?.status !== (vals[":failed"] || vals[":sending"])) throw conflict();
+          messages.set(msg.messageId, { ...msg, status: vals[":st"] || vals[":sending"] });
+          return {};
+        }
         if (failConditionalUnreadOnce && cond.includes("lastMessageAt = :prevLma")) {
           const err = new Error("Newer inbound arrived");
           err.name = "ConditionalCheckFailedException";
@@ -83,6 +97,7 @@ function makeOutboundHarness({
     },
     fetch: async (url) => {
       fetchUrl = url;
+      fetchCalls += 1;
       if (typeof telegramFetchResult === "function") return telegramFetchResult();
       return telegramFetchResult;
     },
@@ -100,6 +115,7 @@ function makeOutboundHarness({
     broadcasts,
     getSsmCalls: () => ssmCalls,
     getFetchUrl: () => fetchUrl,
+    getFetchCalls: () => fetchCalls,
     getConvState: () => convState,
   };
 }
@@ -139,7 +155,7 @@ test("rejects missing JWT claims with 401 and resolves UUID username to email", 
   assert.match(getFetchUrl(), /secret-bot-token-value\/sendMessage$/);
 });
 
-test("Amendment #2: Telegram FAILED preserves unreadCount/lastMessage and never leaks token", async () => {
+test("Unknown Telegram result preserves conversation and redacts token", async () => {
   const { handler, updates, broadcasts, getConvState } = makeOutboundHarness({
     telegramFetchResult: () => {
       throw new Error("Network failure https://api.telegram.org/botsecret-bot-token-value/sendMessage");
@@ -155,10 +171,10 @@ test("Amendment #2: Telegram FAILED preserves unreadCount/lastMessage and never 
   assert.equal(res.statusCode, 200);
   const body = JSON.parse(res.body);
   assert.equal(body.ok, false);
-  assert.equal(body.message.status, "FAILED");
+  assert.equal(body.message.status, "UNKNOWN");
   assert.ok(!body.message.errorDetail.includes("secret-bot-token-value"));
   // Conversation must NOT have unreadCount reset or lastMessage overwritten on FAILED
-  assert.equal(updates.length, 0);
+  assert.equal(updates.filter((update) => update.TableName === "OmniConversations").length, 0);
   assert.equal(getConvState().unreadCount, 2);
   assert.equal(getConvState().lastMessage, "Khách hỏi");
   assert.equal(broadcasts[0].conversation.gsi1pk, undefined);
@@ -249,4 +265,50 @@ test("retryOfMessageId retries only OUTBOUND FAILED messages and updates existin
   assert.equal(body.message.messageId, "MSG#1732264201000#OUT-1111");
   assert.equal(body.message.status, "SENT");
   assert.equal(updates[0].TableName, "OmniMessages");
+});
+
+test("two concurrent retries reserve one Telegram delivery", async () => {
+  const conversationId = "CONV#telegram#678901234";
+  const messageId = "MSG#1732264201000#OUT-retry";
+  const { handler, getFetchCalls } = makeOutboundHarness({
+    msgToRetry: { conversationId, messageId, direction: "OUTBOUND", status: "FAILED", content: "Test" },
+  });
+  const event = {
+    httpMethod: "POST",
+    requestContext: { authorizer: { claims: { email: "agent@example.com" } } },
+    body: JSON.stringify({ conversationId, retryOfMessageId: messageId }),
+  };
+  const results = await Promise.all([handler(event), handler(event)]);
+  assert.deepEqual(results.map((result) => result.statusCode).sort(), [200, 409]);
+  assert.equal(getFetchCalls(), 1);
+});
+
+test("replaying a request ID returns the existing message without a second Telegram call", async () => {
+  const { handler, getFetchCalls } = makeOutboundHarness();
+  const event = {
+    httpMethod: "POST",
+    requestContext: { authorizer: { claims: { email: "agent@example.com" } } },
+    body: JSON.stringify({
+      conversationId: "CONV#telegram#678901234",
+      content: "Test",
+      requestId: "1732264205000-abcdef12-0000-0000-0000-000000000000",
+    }),
+  };
+  const first = JSON.parse((await handler(event)).body);
+  const second = JSON.parse((await handler(event)).body);
+  assert.equal(second.message.messageId, first.message.messageId);
+  assert.equal(second.message.status, "SENT");
+  assert.equal(getFetchCalls(), 1);
+});
+
+test("a confirmed Telegram rejection remains retryable", async () => {
+  const { handler } = makeOutboundHarness({
+    telegramFetchResult: { json: async () => ({ ok: false, error_code: 400, description: "Rejected" }) },
+  });
+  const result = await handler({
+    httpMethod: "POST",
+    requestContext: { authorizer: { claims: { email: "agent@example.com" } } },
+    body: JSON.stringify({ conversationId: "CONV#telegram#678901234", content: "Test" }),
+  });
+  assert.equal(JSON.parse(result.body).message.status, "FAILED");
 });

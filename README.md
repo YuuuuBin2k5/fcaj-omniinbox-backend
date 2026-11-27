@@ -25,11 +25,12 @@ Mã nguồn backend Serverless Event-Driven cho hệ thống **OmniInbox** (AWS 
 1. **UUID-safe `resolveAgentId()` (Amendment #1):** Trong cả `omni-api-handler`, `omni-outbound-sender` và frontend `auth.js`, nếu Cognito sinh `cognito:username` dạng UUID (khi bật Email sign-in), hệ thống tự ưu tiên lấy `claims.email` để khớp `VITE_AGENT_LIST`.
 2. **Bảo vệ `unreadCount` & `lastMessage` khi gửi tin lỗi hoặc có tin xen giữa (Amendment #2):**
    - Trong `omni-outbound-sender`, khi gửi Telegram bị `FAILED`, hàm **không** xóa `unreadCount` về `0` và **không** ghi đè `lastMessage` / `lastMessageAt`.
-   - Khi gửi `SENT`, hàm kiểm tra `ConditionExpression: "lastMessageAt = :prevLma"`; nếu có tin khách mới vừa đến trong lúc đợi Telegram API, preview được cập nhật nhưng `unreadCount > 0` vẫn được giữ nguyên.
+   - Khi gửi `SENT`, hàm đối chiếu cả thời điểm lẫn ID của tin cuối. Nếu có tin khách xen giữa, giữ số chưa đọc và chỉ thay phần xem trước khi phản hồi mới hơn.
 3. **Chống ghi đè bàn giao A -> B & ẩn `gsi1pk` (Amendment #3):**
    - `omni-outbound-sender` chỉ auto-claim `assignedAgent` khi đang `unassigned` bằng conditional `UpdateCommand` (`assignedAgent = :unassigned`), không bao giờ ghi đè nếu đồng nghiệp vừa nhận bàn giao trong lúc gửi Telegram.
    - Mọi sự kiện WebSocket (`NEW_MESSAGE`, `CONVERSATION_UPDATED`, `OUTBOUND_MESSAGE`) và REST API đều lọc bỏ trường nội bộ `gsi1pk`.
-4. **An toàn Idempotency & Fault Injection:**
+4. **Gửi và thử lại:** `POST /messages/reply` nhận `requestId` theo dạng `<epoch-ms>-<uuid>` cho lần gửi mới. Gửi lại cùng ID trả bản ghi đã có. Chỉ một yêu cầu được chuyển tin từ `FAILED` sang `SENDING`. Timeout hoặc lỗi mạng Telegram chuyển tin sang `UNKNOWN`. Nếu Lambda bị gián đoạn sau khi đặt chỗ, tin có thể giữ `SENDING`. Hai trạng thái này cần đối chiếu trước khi gửi lại.
+5. **Idempotency tin đến và Fault Injection:**
    - Khóa idempotency Telegram bắt buộc kèm `chat.id` (`telegram#<chat.id>#<message_id>`).
    - Trạng thái `PROCESSING` (khóa 40s > SQS visibility 30s) -> `DONE`; không bỏ sót tin khi retry.
    - `forceError: true` chỉ ném lỗi DLQ khi `ENABLE_FAULT_INJECTION="true"`.
@@ -41,12 +42,12 @@ Mã nguồn backend Serverless Event-Driven cho hệ thống **OmniInbox** (AWS 
 ```bash
 npm.cmd install       # Cài AWS SDK vào devDependencies để chạy unit test local
 npm.cmd run check     # Chạy static check (verify-lambdas) + toàn bộ unit tests
-npm.cmd run package:core  # Tạo 5 file ZIP chuẩn POSIX cho 5 Lambda lõi trong dist/
+npm.cmd run package:core  # Tạo 5 file ZIP chuẩn POSIX cho 5 Lambda lõi trong dist/core/
 ```
 
 Mỗi hàm được thiết kế không phụ thuộc file ngoài nên:
 - **Cách A (Nhanh nhất trên AWS Console):** Mở `functions/<ten-ham>/index.mjs`, copy toàn bộ nội dung dán vào `index.mjs` trên Lambda Console và bấm **Deploy**.
-- **Cách B (Upload ZIP / AWS CLI):** Chạy `npm.cmd run package:core` -> upload file `dist/<ten-ham>.zip` (đã đặt sẵn quyền file `0644` và để `index.mjs` ở gốc ZIP).
+- **Cách B (Upload ZIP / AWS CLI):** Chạy `npm.cmd run package:core` -> upload file `dist/core/<ten-ham>.zip` (đã đặt sẵn quyền file `0644` và để `index.mjs` ở gốc ZIP).
 
 ---
 
@@ -56,3 +57,5 @@ Mỗi hàm được thiết kế không phụ thuộc file ngoài nên:
 - **Trung Nam (Member 5 — Observability):** Tạo **TRƯỚC** Log Group `/aws/lambda/omni-*` với **retention 7 ngày** trước khi deploy code để tránh mặc định *Never expire*; tạo 2 Alarm (`DLQ >= 1` và metric filter `[NORMALIZER_FAILURE]`).
 - **Hoài Nam (Member 3 — Inbound & REST):** Tạo 4 bảng DynamoDB (`OmniConversations` + GSI `gsi-all-by-time`, `OmniMessages`, `OmniIdempotency` TTL, `OmniWSConnections` TTL), SQS + DLQ (`30s` / `maxReceiveCount=5`), deploy 3 Lambda (`ingest`, `normalizer` batch 5 + ReportBatchItemFailures + concurrency 5, `api-handler`), REST API Gateway + Cognito Authorizer bắt buộc + Gateway Responses CORS + throttling `20/40`.
 - **Duy (Member 4 — WS, Outbound & Hosting):** Tạo Telegram Bot và tự nạp token vào SSM, deploy `omni-ws-handler` + WebSocket API (`prod`), deploy `omni-outbound-sender`, chạy `setWebhook` kèm `secret_token`, và tạo S3 private + CloudFront OAC (custom error `403/404 -> /index.html`). Sau khi có domain CloudFront thật, Hoài Nam & Duy cập nhật `ALLOWED_ORIGIN` từ `*` sang domain CloudFront.
+
+`npm.cmd run package` tạo bộ đầy đủ trong `dist/all/`. Khi triển khai phần lõi, dùng các ZIP trong `dist/core/`.

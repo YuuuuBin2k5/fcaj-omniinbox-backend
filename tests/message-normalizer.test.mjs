@@ -17,6 +17,7 @@ function createNormalizerDdbMock({
   connections = [{ connectionId: "conn-1" }, { connectionId: "conn-gone" }],
   claimError = null,
   transactError = null,
+  concurrentStatus = null,
 } = {}) {
   const calls = {
     put: [],
@@ -46,6 +47,13 @@ function createNormalizerDdbMock({
       if (name === "TransactWriteCommand") {
         calls.transact.push(cmd.input);
         if (transactError) throw transactError;
+        if (concurrentStatus && calls.transact.length === 1) {
+          savedConv = { ...savedConv, status: concurrentStatus };
+          throw Object.assign(new Error("Concurrent conversation update"), {
+            name: "TransactionCanceledException",
+            CancellationReasons: [{ Code: "None" }, { Code: "ConditionalCheckFailed" }],
+          });
+        }
         const u = cmd.input.TransactItems[1].Update;
         savedConv = {
           conversationId: u.Key.conversationId,
@@ -53,8 +61,8 @@ function createNormalizerDdbMock({
           channel: u.ExpressionAttributeValues[":c"],
           customerId: u.ExpressionAttributeValues[":cid"],
           customerName: u.ExpressionAttributeValues[":cname"],
-          lastMessage: u.ExpressionAttributeValues[":lm"],
-          lastMessageAt: u.ExpressionAttributeValues[":lma"],
+          lastMessage: u.ExpressionAttributeValues[":lm"] ?? savedConv?.lastMessage,
+          lastMessageAt: u.ExpressionAttributeValues[":lma"] ?? savedConv?.lastMessageAt,
           status: u.ExpressionAttributeValues[":st"],
           assignedAgent: savedConv?.assignedAgent || "unassigned",
           unreadCount: (savedConv?.unreadCount || 0) + 1,
@@ -247,4 +255,38 @@ test("fault injection is ignored unless ENABLE_FAULT_INJECTION=true", async () =
     ],
   });
   assert.deepEqual(rOn, { batchItemFailures: [{ itemIdentifier: "rec-dlq" }] });
+});
+
+test("a late message is stored without moving the preview backward", async () => {
+  const { ddbClient, calls } = createNormalizerDdbMock({
+    convItem: { status: "RESOLVED", lastMessageAt: "2025-01-01T00:00:00.000Z", lastMessage: "Newer" },
+  });
+  const handler = createHandler({ env: {}, ddbClient });
+  const result = await handler({ Records: [{
+    messageId: "late",
+    body: JSON.stringify({ channel: "telegram", payload: telegramFixture }),
+  }] });
+  assert.deepEqual(result.batchItemFailures, []);
+  const [message, conversation] = calls.transact[0].TransactItems;
+  assert.ok(message.Put.Item.messageId);
+  assert.doesNotMatch(conversation.Update.UpdateExpression, /lastMessage =/);
+  assert.equal(conversation.Update.ExpressionAttributeValues[":st"], "RESOLVED");
+  assert.match(conversation.Update.UpdateExpression, /ADD unreadCount/);
+});
+
+test("the normalizer retries a transaction that loses a concurrent status update", async () => {
+  const { ddbClient, calls } = createNormalizerDdbMock({
+    convItem: { status: "OPEN", lastMessageAt: "2023-01-01T00:00:00.000Z" },
+    concurrentStatus: "IN_PROGRESS",
+  });
+  const handler = createHandler({ env: {}, ddbClient });
+  const result = await handler({ Records: [{
+    messageId: "concurrent",
+    body: JSON.stringify({ channel: "telegram", payload: telegramFixture }),
+  }] });
+  assert.deepEqual(result.batchItemFailures, []);
+  assert.equal(calls.transact.length, 2);
+  const { Update } = calls.transact[1].TransactItems[1];
+  assert.match(Update.ConditionExpression, /#st = :previousstatus/);
+  assert.equal(Update.ExpressionAttributeValues[":st"], "IN_PROGRESS");
 });

@@ -4,8 +4,8 @@ import zlib from "node:zlib";
 
 const ROOT = path.resolve(import.meta.dirname, "..");
 const FUNCTIONS_DIR = path.join(ROOT, "functions");
-const DIST_DIR = path.join(ROOT, "dist");
 const CORE_ONLY = process.argv.includes("--core-only");
+const DIST_DIR = path.join(ROOT, "dist", CORE_ONLY ? "core" : "all");
 
 const FUNCTIONS = [
   { name: "omni-webhook-ingest", core: true },
@@ -109,5 +109,5 @@ for (const fn of targets) {
   const zipBuf = buildSingleFileZip("index.mjs", content);
   fs.writeFileSync(zipPath, zipBuf);
   const tag = fn.core ? "CORE" : "OPTIONAL PHASE 2 (Day 9 Go/No-Go)";
-  console.log(`📦 [${tag}] dist/${fn.name}.zip (${zipBuf.length} bytes)`);
+  console.log(`📦 [${tag}] ${path.relative(ROOT, zipPath)} (${zipBuf.length} bytes)`);
 }
