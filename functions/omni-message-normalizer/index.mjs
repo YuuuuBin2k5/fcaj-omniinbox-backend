@@ -188,16 +188,6 @@ export function createHandler(deps = {}) {
       return;
     }
 
-    // 2. Pre-read conversation to decide status (RESOLVED + customer reply => OPEN)
-    const { Item: existing } = await ddb.send(
-      new GetCommand({
-        TableName: CONV_TABLE,
-        Key: { conversationId: norm.conversationId },
-        ConsistentRead: true,
-      })
-    );
-    const newStatus = !existing || existing.status === "RESOLVED" ? "OPEN" : existing.status;
-
     const createdAt = new Date(norm.createdAtMs).toISOString();
     const messageItem = {
       conversationId: norm.conversationId,
@@ -213,10 +203,40 @@ export function createHandler(deps = {}) {
       clientSentAtMs: norm.clientSentAtMs,
     };
 
-    // 3. Store message + update conversation atomically
-    try {
-      await ddb.send(
-        new TransactWriteCommand({
+    // Recompute against the latest snapshot when another write changes the conversation.
+    for (let attempt = 0; ; attempt += 1) {
+      const { Item: existing } = await ddb.send(new GetCommand({
+        TableName: CONV_TABLE,
+        Key: { conversationId: norm.conversationId },
+        ConsistentRead: true,
+      }));
+      const newer = !existing?.lastMessageAt || createdAt > existing.lastMessageAt
+        || (createdAt === existing.lastMessageAt && messageItem.messageId.localeCompare(existing.lastMessageId || "", "en", { numeric: true }) > 0);
+      const names = { "#st": "status" };
+      const values = {
+        ":pk": "CONV",
+        ":c": norm.channel,
+        ":cid": norm.senderId,
+        ":cname": norm.senderName,
+        ":unassigned": "unassigned",
+        ":one": 1,
+        ":st": !existing?.status || (newer && existing.status === "RESOLVED") ? "OPEN" : existing.status,
+      };
+      const conditions = [];
+      for (const [field, expression] of [["status", "#st"], ["lastMessageAt", "lastMessageAt"], ["lastMessageId", "lastMessageId"]]) {
+        if (existing?.[field] === undefined) {
+          conditions.push(`attribute_not_exists(${expression})`);
+        } else {
+          const token = `:previous${field}`;
+          conditions.push(`${expression} = ${token}`);
+          values[token] = existing[field];
+        }
+      }
+      const preview = newer ? ", lastMessage = :lm, lastMessageAt = :lma, lastMessageId = :lid" : "";
+      if (newer) Object.assign(values, { ":lm": norm.content, ":lma": createdAt, ":lid": messageItem.messageId });
+
+      try {
+        await ddb.send(new TransactWriteCommand({
           TransactItems: [
             {
               Put: {
@@ -230,32 +250,25 @@ export function createHandler(deps = {}) {
                 TableName: CONV_TABLE,
                 Key: { conversationId: norm.conversationId },
                 UpdateExpression:
-                  "SET gsi1pk = :pk, channel = :c, customerId = :cid, customerName = :cname, " +
-                  "lastMessage = :lm, lastMessageAt = :lma, #st = :st, " +
-                  "assignedAgent = if_not_exists(assignedAgent, :unassigned) ADD unreadCount :one",
-                ExpressionAttributeNames: { "#st": "status" },
-                ExpressionAttributeValues: {
-                  ":pk": "CONV",
-                  ":c": norm.channel,
-                  ":cid": norm.senderId,
-                  ":cname": norm.senderName,
-                  ":lm": norm.content,
-                  ":lma": createdAt,
-                  ":st": newStatus,
-                  ":unassigned": "unassigned",
-                  ":one": 1,
-                },
+                  "SET gsi1pk = :pk, channel = :c, customerId = if_not_exists(customerId, :cid), " +
+                  "customerName = if_not_exists(customerName, :cname), #st = :st, " +
+                  "assignedAgent = if_not_exists(assignedAgent, :unassigned)" + preview + " ADD unreadCount :one",
+                ConditionExpression: conditions.join(" AND "),
+                ExpressionAttributeNames: names,
+                ExpressionAttributeValues: values,
               },
             },
           ],
-        })
-      );
-    } catch (err) {
-      const alreadyStored =
-        err.name === "TransactionCanceledException" &&
-        (err.CancellationReasons || []).some((r) => r.Code === "ConditionalCheckFailed");
-      if (!alreadyStored) throw err;
-      console.log(`[IDEMPOTENCY] Message already stored by a previous attempt: ${messageItem.messageId}`);
+        }));
+        break;
+      } catch (err) {
+        if (err.name !== "TransactionCanceledException") throw err;
+        const [messageResult, conversationResult] = err.CancellationReasons || [];
+        if (messageResult?.Code === "ConditionalCheckFailed") break;
+        const retryable = [messageResult, conversationResult].some((reason) => reason?.Code === "TransactionConflict")
+          || conversationResult?.Code === "ConditionalCheckFailed";
+        if (!retryable || attempt >= 2) throw err;
+      }
     }
 
     // 4. Mark DONE
@@ -279,7 +292,7 @@ export function createHandler(deps = {}) {
         })
       );
       if (conv) {
-        const { gsi1pk, ...conversation } = conv;
+        const { gsi1pk, lastMessageId, ...conversation } = conv;
         await broadcastToAgents({ event: "NEW_MESSAGE", conversation, message: messageItem });
       }
     } catch (err) {

@@ -69,7 +69,7 @@ function parseBody(event) {
 
 const publicConversation = (item) => {
   if (!item) return item;
-  const { gsi1pk, ...rest } = item;
+  const { gsi1pk, lastMessageId, ...rest } = item;
   return rest;
 };
 

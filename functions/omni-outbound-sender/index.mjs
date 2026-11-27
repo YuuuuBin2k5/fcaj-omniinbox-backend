@@ -33,7 +33,7 @@ export function resolveAgentId(claims = {}) {
 
 const publicConversation = (item) => {
   if (!item) return item;
-  const { gsi1pk, ...rest } = item;
+  const { gsi1pk, lastMessageId, ...rest } = item;
   return rest;
 };
 
@@ -133,11 +133,15 @@ export function createHandler(deps = {}) {
         signal: AbortSignal.timeout(8000),
       });
       const data = await res.json();
-      if (!data.ok) return { ok: false, errorDetail: data.description || "Telegram API error" };
+      if (data.ok !== true) {
+        const confirmed = data.ok === false && Number.isInteger(data.error_code)
+          && data.error_code >= 400 && data.error_code < 500;
+        return { ok: false, uncertain: !confirmed, errorDetail: confirmed ? data.description || "Telegram API error" : "Telegram delivery unconfirmed" };
+      }
       return { ok: true };
     } catch (err) {
       // Never leak raw error message/URL that might contain the bot token
-      return { ok: false, errorDetail: `Telegram request failed (${err.name})` };
+      return { ok: false, uncertain: true, errorDetail: `Telegram delivery unconfirmed (${err.name})` };
     }
   }
 
@@ -162,7 +166,10 @@ export function createHandler(deps = {}) {
         return respond(400, { error: "Invalid JSON" });
       }
 
-      const { conversationId, retryOfMessageId } = body;
+      const { conversationId, retryOfMessageId, requestId } = body;
+      if (requestId !== undefined && (typeof requestId !== "string" || !/^\d{13}-/.test(requestId) || !UUID_RE.test(requestId.slice(14)))) {
+        return respond(400, { error: "Invalid requestId" });
+      }
       if (typeof conversationId !== "string" || !conversationId.startsWith("CONV#")) {
         return respond(400, { error: "Invalid conversationId" });
       }
@@ -174,7 +181,7 @@ export function createHandler(deps = {}) {
 
       // 3. Conversation MUST exist; derive channel & recipientId strictly on server
       const { Item: conv } = await ddb.send(
-        new GetCommand({ TableName: CONV_TABLE, Key: { conversationId } })
+        new GetCommand({ TableName: CONV_TABLE, Key: { conversationId }, ConsistentRead: true })
       );
       if (!conv) return respond(404, { error: "Conversation not found" });
 
@@ -192,9 +199,13 @@ export function createHandler(deps = {}) {
           new GetCommand({
             TableName: MSG_TABLE,
             Key: { conversationId, messageId: retryOfMessageId },
+            ConsistentRead: true,
           })
         );
         if (!Item) return respond(404, { error: "Message to retry not found" });
+        if (Item.status === "SENDING" || Item.status === "UNKNOWN") {
+          return respond(409, { error: "Delivery is pending or unconfirmed", message: Item });
+        }
         if (Item.direction !== "OUTBOUND" || Item.status !== "FAILED") {
           return respond(400, { error: "Only FAILED outbound messages can be retried" });
         }
@@ -202,163 +213,171 @@ export function createHandler(deps = {}) {
         content = Item.content;
       }
 
-      // 5. Deliver: Telegram = real HTTP Bot API; Shopee/Zalo/WebChat = simulated (no external HTTP)
-      let status = "SENT";
-      let errorDetail;
-      let deliveredVia = "simulator";
-      if (channel === "telegram") {
-        deliveredVia = "telegram";
-        const result = await sendViaTelegram(recipientId, content);
-        if (!result.ok) {
-          status = "FAILED";
-          errorDetail = result.errorDetail;
+      // Reserve the delivery before calling Telegram. An interrupted attempt stays non-retryable.
+      const startedMs = now();
+      const deliveredVia = channel === "telegram" ? "telegram" : "simulator";
+      const message = existing || {
+        conversationId,
+        messageId: requestId
+          ? `MSG#${requestId.slice(0, 13)}#OUT-${requestId}`
+          : `MSG#${String(startedMs).padStart(13, "0")}#OUT-${uuid()}`,
+        channel,
+        channelMessageId: "",
+        direction: "OUTBOUND",
+        senderId: agentId,
+        senderName: agentId,
+        content,
+        deliveredVia,
+        agentId,
+        createdAt: new Date(startedMs).toISOString(),
+      };
+      const key = { conversationId, messageId: message.messageId };
+      try {
+        if (existing) {
+          await ddb.send(new UpdateCommand({
+            TableName: MSG_TABLE,
+            Key: key,
+            UpdateExpression: "SET #st = :sending",
+            ConditionExpression: "#st = :failed",
+            ExpressionAttributeNames: { "#st": "status" },
+            ExpressionAttributeValues: { ":sending": "SENDING", ":failed": "FAILED" },
+          }));
+        } else {
+          await ddb.send(new PutCommand({
+            TableName: MSG_TABLE,
+            Item: { ...message, status: "SENDING" },
+            ConditionExpression: "attribute_not_exists(messageId)",
+          }));
         }
+      } catch (err) {
+        if (err.name !== "ConditionalCheckFailedException") throw err;
+        const { Item } = await ddb.send(new GetCommand({ TableName: MSG_TABLE, Key: key, ConsistentRead: true }));
+        if (!existing && Item?.agentId === agentId && Item.content === content) {
+          return respond(200, { ok: Item.status === "SENT", message: Item });
+        }
+        return respond(409, { error: "Message is already being handled", message: Item });
       }
 
-      // 6. Persist OUTBOUND message
-      const nowMs = now();
-      const nowIso = new Date(nowMs).toISOString();
-      let outboundMsg;
-      if (existing) {
-        await ddb.send(
-          new UpdateCommand({
-            TableName: MSG_TABLE,
-            Key: { conversationId, messageId: existing.messageId },
-            UpdateExpression:
-              "SET #st = :st, errorDetail = :ed, deliveredVia = :dv, agentId = :ag, retriedAt = :now",
-            ExpressionAttributeNames: { "#st": "status" },
-            ExpressionAttributeValues: {
-              ":st": status,
-              ":ed": errorDetail ?? null,
-              ":dv": deliveredVia,
-              ":ag": agentId,
-              ":now": nowIso,
-            },
-          })
-        );
-        outboundMsg = {
-          ...existing,
-          status,
-          errorDetail: errorDetail ?? null,
-          deliveredVia,
-          agentId,
-          retriedAt: nowIso,
-        };
-      } else {
-        outboundMsg = {
-          conversationId,
-          messageId: `MSG#${String(nowMs).padStart(13, "0")}#OUT-${uuid().slice(0, 8)}`,
-          channel,
-          channelMessageId: "",
-          direction: "OUTBOUND",
-          senderId: agentId,
-          senderName: agentId,
-          content,
-          status,
-          errorDetail,
-          deliveredVia,
-          agentId,
-          createdAt: nowIso,
-        };
-        await ddb.send(
-          new PutCommand({
-            TableName: MSG_TABLE,
-            Item: outboundMsg,
-            ConditionExpression: "attribute_not_exists(messageId)",
-          })
-        );
-      }
+      const delivery = channel === "telegram" ? await sendViaTelegram(recipientId, content) : { ok: true };
+      const status = delivery.ok ? "SENT" : delivery.uncertain ? "UNKNOWN" : "FAILED";
+      const errorDetail = delivery.errorDetail ?? null;
+      const nowIso = new Date(now()).toISOString();
+      const outboundMsg = { ...message, status, errorDetail, deliveredVia, agentId };
+      if (existing) outboundMsg.retriedAt = nowIso;
+      await ddb.send(new UpdateCommand({
+        TableName: MSG_TABLE,
+        Key: key,
+        UpdateExpression: "SET #st = :st, errorDetail = :ed, deliveredVia = :dv, agentId = :ag"
+          + (existing ? ", retriedAt = :now" : ""),
+        ConditionExpression: "#st = :sending",
+        ExpressionAttributeNames: { "#st": "status" },
+        ExpressionAttributeValues: {
+          ":st": status, ":ed": errorDetail, ":dv": deliveredVia, ":ag": agentId, ":sending": "SENDING",
+          ...(existing ? { ":now": nowIso } : {}),
+        },
+        ReturnValues: "ALL_NEW",
+      }));
 
       // 7. Update conversation safely (Amendments #2 & #3):
       //    - On FAILED: do NOT reset unreadCount or overwrite lastMessage/lastMessageAt.
       //    - On SENT: clear unreadCount ONLY if no newer inbound message arrived during delivery;
       //      auto-claim assignedAgent / advance OPEN->IN_PROGRESS ONLY conditionally so concurrent handovers are never overwritten.
       let latestConv = conv;
-      if (status === "SENT") {
-        const sets = ["unreadCount = :zero"];
-        const values = { ":zero": 0, ":prevLma": conv.lastMessageAt };
-        if (!existing) {
-          sets.push("lastMessage = :lm", "lastMessageAt = :lma");
-          values[":lm"] = `[NV] ${content}`.slice(0, 200);
-          values[":lma"] = nowIso;
-        }
-
-        try {
-          const res = await ddb.send(
-            new UpdateCommand({
-              TableName: CONV_TABLE,
-              Key: { conversationId },
-              UpdateExpression: `SET ${sets.join(", ")}`,
-              ConditionExpression: "attribute_exists(conversationId) AND lastMessageAt = :prevLma",
-              ExpressionAttributeValues: values,
-              ReturnValues: "ALL_NEW",
-            })
-          );
-          if (res.Attributes) latestConv = res.Attributes;
-        } catch (err) {
-          if (err.name !== "ConditionalCheckFailedException") throw err;
-
-          const { Item: currentConv } = await ddb.send(
-            new GetCommand({ TableName: CONV_TABLE, Key: { conversationId }, ConsistentRead: true })
-          );
-          if (!currentConv) return respond(404, { error: "Conversation not found" });
-          latestConv = currentConv;
-
-          // Newer inbound message arrived in-flight => update preview without clearing unreadCount
-          if (!existing) {
-            const res = await ddb.send(
-              new UpdateCommand({
-                TableName: CONV_TABLE,
-                Key: { conversationId },
-                UpdateExpression: "SET lastMessage = :lm, lastMessageAt = :lma",
-                ConditionExpression: "attribute_exists(conversationId)",
-                ExpressionAttributeValues: {
-                  ":lm": `[NV] ${content}`.slice(0, 200),
-                  ":lma": nowIso,
-                },
-                ReturnValues: "ALL_NEW",
-              })
-            );
-            if (res.Attributes) latestConv = res.Attributes;
+      try {
+        if (status === "SENT") {
+          const sets = ["unreadCount = :zero"];
+          const values = { ":zero": 0, ":prevLma": conv.lastMessageAt };
+          const sameMessage = conv.lastMessageId === undefined ? "attribute_not_exists(lastMessageId)" : "lastMessageId = :prevId";
+          if (conv.lastMessageId !== undefined) values[":prevId"] = conv.lastMessageId;
+          if (!existing && nowIso > conv.lastMessageAt) {
+            sets.push("lastMessage = :lm", "lastMessageAt = :lma", "lastMessageId = :lid");
+            values[":lid"] = outboundMsg.messageId;
+            values[":lm"] = `[NV] ${content}`.slice(0, 200);
+            values[":lma"] = nowIso;
           }
-        }
 
-        if (!conv.assignedAgent || conv.assignedAgent === "unassigned") {
           try {
             const res = await ddb.send(
               new UpdateCommand({
                 TableName: CONV_TABLE,
                 Key: { conversationId },
-                UpdateExpression: "SET assignedAgent = :ag",
-                ConditionExpression: "attribute_not_exists(assignedAgent) OR assignedAgent = :unassigned",
-                ExpressionAttributeValues: { ":ag": agentId, ":unassigned": "unassigned" },
+                UpdateExpression: `SET ${sets.join(", ")}`,
+                ConditionExpression: `attribute_exists(conversationId) AND lastMessageAt = :prevLma AND ${sameMessage}`,
+                ExpressionAttributeValues: values,
                 ReturnValues: "ALL_NEW",
               })
             );
             if (res.Attributes) latestConv = res.Attributes;
           } catch (err) {
             if (err.name !== "ConditionalCheckFailedException") throw err;
+
+            const { Item: currentConv } = await ddb.send(
+              new GetCommand({ TableName: CONV_TABLE, Key: { conversationId }, ConsistentRead: true })
+            );
+            if (!currentConv) throw new Error("Conversation no longer exists");
+            latestConv = currentConv;
+
+            // Newer inbound message arrived in-flight => update preview without clearing unreadCount
+            if (!existing && currentConv.lastMessageAt < nowIso) {
+              const res = await ddb.send(
+                new UpdateCommand({
+                  TableName: CONV_TABLE,
+                  Key: { conversationId },
+                  UpdateExpression: "SET lastMessage = :lm, lastMessageAt = :lma, lastMessageId = :lid",
+                  ConditionExpression: "lastMessageAt < :lma",
+                  ExpressionAttributeValues: {
+                    ":lm": `[NV] ${content}`.slice(0, 200),
+                    ":lma": nowIso,
+                  ":lid": outboundMsg.messageId,
+                  },
+                  ReturnValues: "ALL_NEW",
+                })
+              );
+              if (res.Attributes) latestConv = res.Attributes;
+            }
+          }
+
+          if (!conv.assignedAgent || conv.assignedAgent === "unassigned") {
+            try {
+              const res = await ddb.send(
+                new UpdateCommand({
+                  TableName: CONV_TABLE,
+                  Key: { conversationId },
+                  UpdateExpression: "SET assignedAgent = :ag",
+                  ConditionExpression: "attribute_exists(conversationId) AND (attribute_not_exists(assignedAgent) OR assignedAgent = :unassigned)",
+                  ExpressionAttributeValues: { ":ag": agentId, ":unassigned": "unassigned" },
+                  ReturnValues: "ALL_NEW",
+                })
+              );
+              if (res.Attributes) latestConv = res.Attributes;
+            } catch (err) {
+              if (err.name !== "ConditionalCheckFailedException") throw err;
+            }
+          }
+
+          if (!conv.status || conv.status === "OPEN") {
+            try {
+              const res = await ddb.send(
+                new UpdateCommand({
+                  TableName: CONV_TABLE,
+                  Key: { conversationId },
+                  UpdateExpression: "SET #st = :inProgress",
+                  ConditionExpression: "attribute_exists(conversationId) AND (attribute_not_exists(#st) OR #st = :open)",
+                  ExpressionAttributeNames: { "#st": "status" },
+                  ExpressionAttributeValues: { ":inProgress": "IN_PROGRESS", ":open": "OPEN" },
+                  ReturnValues: "ALL_NEW",
+                })
+              );
+              if (res.Attributes) latestConv = res.Attributes;
+            } catch (err) {
+              if (err.name !== "ConditionalCheckFailedException") throw err;
+            }
           }
         }
 
-        if (!conv.status || conv.status === "OPEN") {
-          try {
-            const res = await ddb.send(
-              new UpdateCommand({
-                TableName: CONV_TABLE,
-                Key: { conversationId },
-                UpdateExpression: "SET #st = :inProgress",
-                ConditionExpression: "attribute_not_exists(#st) OR #st = :open",
-                ExpressionAttributeNames: { "#st": "status" },
-                ExpressionAttributeValues: { ":inProgress": "IN_PROGRESS", ":open": "OPEN" },
-                ReturnValues: "ALL_NEW",
-              })
-            );
-            if (res.Attributes) latestConv = res.Attributes;
-          } catch (err) {
-            if (err.name !== "ConditionalCheckFailedException") throw err;
-          }
-        }
+      } catch (err) {
+        console.warn("Delivery saved but conversation update failed:", err.name);
+        latestConv = null;
       }
 
       // 8. Strip internal gsi1pk and broadcast best-effort
@@ -371,7 +390,7 @@ export function createHandler(deps = {}) {
       return respond(200, { ok: status === "SENT", message: outboundMsg });
     } catch (err) {
       console.error("Outbound Sender Error:", err);
-      return respond(500, { error: "Internal error" });
+      return respond(500, { error: "Could not confirm delivery" });
     }
   };
 }
