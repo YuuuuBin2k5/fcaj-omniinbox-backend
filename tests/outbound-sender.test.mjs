@@ -14,6 +14,7 @@ function makeOutboundHarness({
     unreadCount: 2,
   },
   msgToRetry = null,
+  connections = [{ connectionId: "c1", clientType: "portal" }],
   failConditionalUnreadOnce = false,
   failClaimCondition = false,
   telegramFetchResult = { ok: true, json: async () => ({ ok: true }) },
@@ -21,6 +22,7 @@ function makeOutboundHarness({
   const puts = [];
   const updates = [];
   const broadcasts = [];
+  const broadcastTargets = [];
   let ssmCalls = 0;
   let fetchUrl = null;
   let convState = { ...conv };
@@ -56,7 +58,6 @@ function makeOutboundHarness({
         if (failConditionalUnreadOnce && cond.includes("lastMessageAt = :prevLma")) {
           const err = new Error("Newer inbound arrived");
           err.name = "ConditionalCheckFailedException";
-          // Simulate newer inbound customer message updating convState
           convState = {
             ...convState,
             lastMessage: "Tin nhắn mới xen giữa",
@@ -75,11 +76,12 @@ function makeOutboundHarness({
         if (vals[":zero"] === 0) convState.unreadCount = 0;
         if (vals[":lm"]) convState.lastMessage = vals[":lm"];
         if (vals[":lma"]) convState.lastMessageAt = vals[":lma"];
+        if (vals[":dir"]) convState.lastMessageDirection = vals[":dir"];
         if (vals[":ag"] && cmd.input.TableName === "OmniConversations") convState.assignedAgent = vals[":ag"];
         if (vals[":inProgress"]) convState.status = vals[":inProgress"];
         return { Attributes: { ...convState } };
       }
-      if (name === "ScanCommand") return { Items: [{ connectionId: "c1" }] };
+      if (name === "ScanCommand") return { Items: connections };
       return {};
     },
   };
@@ -92,17 +94,18 @@ function makeOutboundHarness({
     ssmClient: {
       async send() {
         ssmCalls += 1;
-        return { Parameter: { Value: "secret-bot-token-value" } };
+        return { Parameter: { Value: `secret-bot-token-${ssmCalls}` } };
       },
     },
     fetch: async (url) => {
       fetchUrl = url;
       fetchCalls += 1;
-      if (typeof telegramFetchResult === "function") return telegramFetchResult();
+      if (typeof telegramFetchResult === "function") return telegramFetchResult(url, fetchCalls);
       return telegramFetchResult;
     },
     createWsClient: () => ({
       async send(cmd) {
+        broadcastTargets.push(cmd.input.ConnectionId);
         broadcasts.push(JSON.parse(Buffer.from(cmd.input.Data).toString("utf8")));
       },
     }),
@@ -113,6 +116,7 @@ function makeOutboundHarness({
     puts,
     updates,
     broadcasts,
+    broadcastTargets,
     getSsmCalls: () => ssmCalls,
     getFetchUrl: () => fetchUrl,
     getFetchCalls: () => fetchCalls,
@@ -152,13 +156,15 @@ test("rejects missing JWT claims with 401 and resolves UUID username to email", 
   assert.equal(body.message.agentId, "agent.minh@omniinbox.local");
   assert.equal(body.message.channel, "telegram");
   assert.equal(body.message.deliveredVia, "telegram");
-  assert.match(getFetchUrl(), /secret-bot-token-value\/sendMessage$/);
+  assert.equal(body.conversation.lastMessageDirection, "OUTBOUND");
+  assert.equal(body.conversation.gsi1pk, undefined);
+  assert.match(getFetchUrl(), /secret-bot-token-1\/sendMessage$/);
 });
 
-test("Unknown Telegram result preserves conversation and redacts token", async () => {
+test("Unknown Telegram result preserves conversation unread/preview and redacts token", async () => {
   const { handler, updates, broadcasts, getConvState } = makeOutboundHarness({
     telegramFetchResult: () => {
-      throw new Error("Network failure https://api.telegram.org/botsecret-bot-token-value/sendMessage");
+      throw new Error("Network failure https://api.telegram.org/botsecret-bot-token-1/sendMessage");
     },
   });
 
@@ -172,9 +178,11 @@ test("Unknown Telegram result preserves conversation and redacts token", async (
   const body = JSON.parse(res.body);
   assert.equal(body.ok, false);
   assert.equal(body.message.status, "UNKNOWN");
-  assert.ok(!body.message.errorDetail.includes("secret-bot-token-value"));
-  // Conversation must NOT have unreadCount reset or lastMessage overwritten on FAILED
-  assert.equal(updates.filter((update) => update.TableName === "OmniConversations").length, 0);
+  assert.ok(!body.message.errorDetail.includes("secret-bot-token"));
+  // Only the initial unassigned->agent claim may update OmniConversations; unread/preview MUST stay untouched
+  const convUpdates = updates.filter((update) => update.TableName === "OmniConversations");
+  assert.equal(convUpdates.length, 1);
+  assert.equal(convUpdates[0].UpdateExpression, "SET assignedAgent = :ag");
   assert.equal(getConvState().unreadCount, 2);
   assert.equal(getConvState().lastMessage, "Khách hỏi");
   assert.equal(broadcasts[0].conversation.gsi1pk, undefined);
@@ -197,21 +205,41 @@ test("Amendment #2: newer customer message arriving in-flight keeps unreadCount 
   assert.equal(broadcasts[0].conversation.unreadCount, 3);
 });
 
-test("Amendment #3: concurrent A->B handover is never overwritten by A reply and gsi1pk is stripped", async () => {
-  const { handler, broadcasts, getConvState } = makeOutboundHarness({
-    failClaimCondition: true,
-  });
-
-  const res = await handler({
+test("Ownership Guard: rejects reply with 409 when conversation is already assigned or claimed by another agent", async () => {
+  // Case 1: Concurrent claim race lost to agent.lan before calling Telegram
+  const raced = makeOutboundHarness({ failClaimCondition: true });
+  const rRace = await raced.handler({
     httpMethod: "POST",
     requestContext: { authorizer: { claims: { email: "agent.minh@omniinbox.local" } } },
     body: JSON.stringify({ conversationId: "CONV#telegram#678901234", content: "Em gửi ạ" }),
   });
+  assert.equal(rRace.statusCode, 409);
+  const raceBody = JSON.parse(rRace.body);
+  assert.equal(raceBody.error, "CONVERSATION_ASSIGNED_TO_OTHER");
+  assert.equal(raceBody.conversation.assignedAgent, "agent.lan@omniinbox.local");
+  assert.equal(raceBody.conversation.gsi1pk, undefined);
+  assert.equal(raced.getFetchCalls(), 0);
 
-  assert.equal(res.statusCode, 200);
-  assert.equal(getConvState().assignedAgent, "agent.lan@omniinbox.local");
-  assert.equal(broadcasts[0].conversation.assignedAgent, "agent.lan@omniinbox.local");
-  assert.equal(broadcasts[0].conversation.gsi1pk, undefined);
+  // Case 2: Conversation already assigned to agent.lan
+  const foreign = makeOutboundHarness({
+    conv: {
+      conversationId: "CONV#telegram#678901234",
+      gsi1pk: "CONV",
+      channel: "telegram",
+      lastMessage: "Khách hỏi",
+      lastMessageAt: "2024-11-22T08:30:00.000Z",
+      status: "IN_PROGRESS",
+      assignedAgent: "agent.lan@omniinbox.local",
+      unreadCount: 1,
+    },
+  });
+  const rForeign = await foreign.handler({
+    httpMethod: "POST",
+    requestContext: { authorizer: { claims: { email: "agent.minh@omniinbox.local" } } },
+    body: JSON.stringify({ conversationId: "CONV#telegram#678901234", content: "Em chen ngang" }),
+  });
+  assert.equal(rForeign.statusCode, 409);
+  assert.equal(foreign.getFetchCalls(), 0);
 });
 
 test("Simulator channels set deliveredVia=simulator without external HTTP calls", async () => {
@@ -242,6 +270,16 @@ test("Simulator channels set deliveredVia=simulator without external HTTP calls"
 
 test("retryOfMessageId retries only OUTBOUND FAILED messages and updates existing record", async () => {
   const { handler, updates } = makeOutboundHarness({
+    conv: {
+      conversationId: "CONV#telegram#678901234",
+      gsi1pk: "CONV",
+      channel: "telegram",
+      lastMessage: "Khách hỏi",
+      lastMessageAt: "2024-11-22T08:30:00.000Z",
+      status: "OPEN",
+      assignedAgent: "agent.minh@omniinbox.local",
+      unreadCount: 2,
+    },
     msgToRetry: {
       conversationId: "CONV#telegram#678901234",
       messageId: "MSG#1732264201000#OUT-1111",
@@ -271,6 +309,16 @@ test("two concurrent retries reserve one Telegram delivery", async () => {
   const conversationId = "CONV#telegram#678901234";
   const messageId = "MSG#1732264201000#OUT-retry";
   const { handler, getFetchCalls } = makeOutboundHarness({
+    conv: {
+      conversationId,
+      gsi1pk: "CONV",
+      channel: "telegram",
+      lastMessage: "Khách hỏi",
+      lastMessageAt: "2024-11-22T08:30:00.000Z",
+      status: "OPEN",
+      assignedAgent: "agent@example.com",
+      unreadCount: 1,
+    },
     msgToRetry: { conversationId, messageId, direction: "OUTBOUND", status: "FAILED", content: "Test" },
   });
   const event = {
@@ -283,7 +331,7 @@ test("two concurrent retries reserve one Telegram delivery", async () => {
   assert.equal(getFetchCalls(), 1);
 });
 
-test("replaying a request ID returns the existing message without a second Telegram call", async () => {
+test("replaying a request ID returns the existing message and conversation without a second Telegram call", async () => {
   const { handler, getFetchCalls } = makeOutboundHarness();
   const event = {
     httpMethod: "POST",
@@ -298,6 +346,7 @@ test("replaying a request ID returns the existing message without a second Teleg
   const second = JSON.parse((await handler(event)).body);
   assert.equal(second.message.messageId, first.message.messageId);
   assert.equal(second.message.status, "SENT");
+  assert.ok(second.conversation);
   assert.equal(getFetchCalls(), 1);
 });
 
@@ -311,4 +360,43 @@ test("a confirmed Telegram rejection remains retryable", async () => {
     body: JSON.stringify({ conversationId: "CONV#telegram#678901234", content: "Test" }),
   });
   assert.equal(JSON.parse(result.body).message.status, "FAILED");
+});
+
+test("Telegram WS broadcast skips simulator connections and auto-refreshes SSM token on 401", async () => {
+  const { handler, broadcastTargets, getSsmCalls, getFetchCalls } = makeOutboundHarness({
+    connections: [
+      { connectionId: "conn-portal", clientType: "portal" },
+      { connectionId: "conn-sim", clientType: "simulator" },
+    ],
+    telegramFetchResult: (_url, attempt) => ({
+      json: async () =>
+        attempt === 2
+          ? { ok: false, error_code: 401, description: "Unauthorized" }
+          : { ok: true },
+    }),
+  });
+
+  const evt = {
+    httpMethod: "POST",
+    requestContext: { authorizer: { claims: { email: "agent.minh@omniinbox.local" } } },
+    body: JSON.stringify({
+      conversationId: "CONV#telegram#678901234",
+      content: "Lần 1",
+      requestId: "1732264205000-11111111-1111-1111-1111-111111111111",
+    }),
+  };
+  await handler(evt); // caches token v1, attempt 1 succeeds
+  const res2 = await handler({
+    ...evt,
+    body: JSON.stringify({
+      conversationId: "CONV#telegram#678901234",
+      content: "Lần 2",
+      requestId: "1732264206000-22222222-2222-2222-2222-222222222222",
+    }),
+  }); // attempt 2 gets 401 from cache -> refreshes token v2 -> attempt 3 succeeds
+
+  assert.equal(JSON.parse(res2.body).ok, true);
+  assert.equal(getSsmCalls(), 2);
+  assert.equal(getFetchCalls(), 3);
+  assert.deepEqual(broadcastTargets, ["conn-portal", "conn-portal"]);
 });

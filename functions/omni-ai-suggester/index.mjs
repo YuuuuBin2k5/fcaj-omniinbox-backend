@@ -74,7 +74,10 @@ export function createHandler(deps = {}) {
     if (method === "OPTIONS") return { statusCode: 200, headers: corsHeaders, body: "" };
 
     try {
-      const claims = event.requestContext?.authorizer?.claims || {};
+      const claims =
+        event.requestContext?.authorizer?.claims ||
+        event.requestContext?.authorizer?.jwt?.claims ||
+        {};
       if (!claims["cognito:username"] && !claims.email) {
         return respond(401, { error: "Unauthorized" });
       }
