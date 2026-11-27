@@ -87,3 +87,38 @@ test("$connect stores connection with 3h TTL, $disconnect deletes it, $default r
   assert.equal(disconnect.statusCode, 200);
   assert.equal(ops[2].input.Key.connectionId, "conn-abc");
 });
+
+test("$connect defaults clientType to portal and preserves simulator scope", async () => {
+  const ops = [];
+  const handler = createHandler({
+    now: () => 1732264200000,
+    ddbClient: {
+      async send(cmd) {
+        ops.push(cmd.input);
+        if (cmd.constructor.name === "DeleteCommand") {
+          return {
+            Attributes: {
+              agent: "agent.minh@omniinbox.local",
+              clientType: "simulator",
+              expiresAt: 1732264260000,
+            },
+          };
+        }
+        return {};
+      },
+    },
+  });
+
+  const res = await handler({
+    requestContext: { routeKey: "$connect", connectionId: "conn-sim-1" },
+    queryStringParameters: { ticket: "sim-ticket" },
+  });
+  assert.equal(res.statusCode, 200);
+  assert.equal(ops[1].Item.clientType, "simulator");
+
+  const missingConn = await handler({
+    requestContext: { routeKey: "$connect" },
+    queryStringParameters: { ticket: "sim-ticket" },
+  });
+  assert.equal(missingConn.statusCode, 400);
+});

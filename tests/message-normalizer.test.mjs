@@ -290,3 +290,129 @@ test("the normalizer retries a transaction that loses a concurrent status update
   assert.match(Update.ConditionExpression, /#st = :previousstatus/);
   assert.equal(Update.ExpressionAttributeValues[":st"], "IN_PROGRESS");
 });
+
+test("extracts Telegram media/caption/sticker instead of silently dropping attachments", () => {
+  const photoWithCaption = normalizeInboundPayload(
+    "telegram",
+    {
+      message: {
+        message_id: 501,
+        date: 1732264300,
+        chat: { id: 678901234 },
+        from: { first_name: "Minh" },
+        photo: [{ file_id: "p1" }],
+        caption: "Đã chuyển khoản đơn #123 ạ",
+      },
+    },
+    "2024-11-22T08:31:40.200Z"
+  );
+  assert.equal(photoWithCaption.ignored, false);
+  assert.equal(photoWithCaption.mediaType, "photo");
+  assert.equal(photoWithCaption.content, "[Hình ảnh] Đã chuyển khoản đơn #123 ạ");
+
+  const stickerOnly = normalizeInboundPayload(
+    "telegram",
+    {
+      message: {
+        message_id: 502,
+        date: 1732264301,
+        chat: { id: 678901234 },
+        sticker: { emoji: "👍" },
+      },
+    },
+    "2024-11-22T08:31:41.100Z"
+  );
+  assert.equal(stickerOnly.ignored, false);
+  assert.equal(stickerOnly.mediaType, "sticker");
+  assert.match(stickerOnly.content, /Sticker 👍/);
+});
+
+test("same-second Telegram message after agent outbound reply reopens RESOLVED -> OPEN and updates preview", async () => {
+  // Outbound reply happened at 1732264205.450Z (within second 1732264205)
+  const { ddbClient, calls } = createNormalizerDdbMock({
+    convItem: {
+      conversationId: "CONV#telegram#678901234",
+      status: "RESOLVED",
+      assignedAgent: "agent.minh@omniinbox.local",
+      lastMessage: "[NV] Cảm ơn anh",
+      lastMessageAt: "2024-11-22T08:30:05.450Z",
+      lastMessageId: "MSG#1732264205450#OUT-1",
+      unreadCount: 0,
+    },
+  });
+
+  // Telegram reports date=1732264205 (second precision) while ingest receivedAt is .200Z (earlier ms in same sec)
+  // or slightly delayed/same sec -> normalizer bumps effectiveCreatedAtMs past .450Z safely inside that second
+  const handler = createHandler({
+    ddbClient,
+    now: () => 1732264205800,
+  });
+
+  const sameSecondUpdate = {
+    message: {
+      message_id: 998900,
+      date: 1732264205,
+      chat: { id: 678901234 },
+      from: { first_name: "Văn A", last_name: "Nguyễn Mới" },
+      text: "Khoan shop ơi đổi size XL nhé",
+    },
+  };
+
+  const res = await handler({
+    Records: [
+      {
+        messageId: "rec-same-sec",
+        body: JSON.stringify({
+          channel: "telegram",
+          receivedAt: "2024-11-22T08:30:05.600Z",
+          payload: sameSecondUpdate,
+        }),
+      },
+    ],
+  });
+
+  assert.deepEqual(res, { batchItemFailures: [] });
+  const [putMsg, updConv] = calls.transact[0].TransactItems;
+  assert.equal(updConv.Update.ExpressionAttributeValues[":st"], "OPEN");
+  assert.equal(updConv.Update.ExpressionAttributeValues[":dir"], "INBOUND");
+  assert.equal(updConv.Update.ExpressionAttributeValues[":cname"], "Văn A Nguyễn Mới");
+  assert.match(updConv.Update.UpdateExpression, /customerName = :cname/);
+  assert.ok(putMsg.Put.Item.createdAt > "2024-11-22T08:30:05.450Z");
+});
+
+test("uses 20s STALE_LOCK_MS and skips simulator-only WS connections during broadcast", async () => {
+  const delivered = [];
+  const { ddbClient, calls } = createNormalizerDdbMock({
+    connections: [
+      { connectionId: "conn-portal", clientType: "portal" },
+      { connectionId: "conn-sim", clientType: "simulator" },
+    ],
+  });
+  const nowMs = 1732264250000;
+  const handler = createHandler({
+    env: { WS_ENDPOINT: "https://ws.example.com/prod" },
+    ddbClient,
+    now: () => nowMs,
+    createWsClient: () => ({
+      async send(cmd) {
+        delivered.push(cmd.input.ConnectionId);
+      },
+    }),
+  });
+
+  await handler({
+    Records: [
+      {
+        messageId: "rec-scope",
+        body: JSON.stringify({
+          channel: "telegram",
+          receivedAt: new Date(nowMs).toISOString(),
+          payload: telegramFixture,
+        }),
+      },
+    ],
+  });
+
+  assert.equal(calls.put[0].ExpressionAttributeValues[":staleBefore"], nowMs - 20_000);
+  assert.deepEqual(delivered, ["conn-portal"]);
+});

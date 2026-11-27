@@ -167,3 +167,70 @@ test("decodes base64Encoded body cleanly", async () => {
   assert.equal(res.statusCode, 200);
   assert.equal(sqsSent.length, 1);
 });
+
+test("SSM secret cache refreshes after 5m TTL and retries once on secret rotation", async () => {
+  let clock = 1732264205000;
+  let activeSecret = "secret-v1";
+  let ssmCalls = 0;
+
+  const { deps, sqsSent } = makeDeps({
+    ssmClient: {
+      async send() {
+        ssmCalls += 1;
+        return { Parameter: { Value: activeSecret } };
+      },
+    },
+  });
+  deps.now = () => clock;
+  const handler = createHandler(deps);
+
+  const callWith = (token) =>
+    handler({
+      httpMethod: "POST",
+      pathParameters: { channel: "telegram" },
+      headers: { "x-telegram-bot-api-secret-token": token },
+      body: JSON.stringify(telegramFixture),
+    });
+
+  // Initial fetch populates cache
+  assert.equal((await callWith("secret-v1")).statusCode, 200);
+  assert.equal(ssmCalls, 1);
+
+  // Secret rotates in SSM -> mismatch triggers immediate refresh from SSM without 403 downtime
+  activeSecret = "secret-v2";
+  assert.equal((await callWith("secret-v2")).statusCode, 200);
+  assert.equal(ssmCalls, 2);
+
+  // Within 5m TTL cache is reused
+  clock += 60_000;
+  assert.equal((await callWith("secret-v2")).statusCode, 200);
+  assert.equal(ssmCalls, 2);
+
+  // Past 5m TTL cache expires cleanly
+  clock += 5 * 60 * 1000;
+  assert.equal((await callWith("secret-v2")).statusCode, 200);
+  assert.equal(ssmCalls, 3);
+  assert.equal(sqsSent.length, 4);
+});
+
+test("REQUIRE_SIMULATOR_AUTH=true rejects anonymous simulator POST with 401 and allows Cognito JWT", async () => {
+  const { deps, sqsSent } = makeDeps({ env: { REQUIRE_SIMULATOR_AUTH: "true" } });
+  const handler = createHandler(deps);
+
+  const anon = await handler({
+    httpMethod: "POST",
+    pathParameters: { channel: "shopee" },
+    body: JSON.stringify(simulatorFixture),
+  });
+  assert.equal(anon.statusCode, 401);
+  assert.equal(sqsSent.length, 0);
+
+  const authed = await handler({
+    httpMethod: "POST",
+    pathParameters: { channel: "shopee" },
+    requestContext: { authorizer: { claims: { email: "agent.minh@omniinbox.local" } } },
+    body: JSON.stringify(simulatorFixture),
+  });
+  assert.equal(authed.statusCode, 200);
+  assert.equal(sqsSent.length, 1);
+});

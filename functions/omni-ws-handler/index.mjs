@@ -36,6 +36,9 @@ export function createHandler(deps = {}) {
 
     try {
       if (routeKey === "$connect") {
+        if (!connectionId) {
+          return { statusCode: 400, body: "Missing connectionId" };
+        }
         const ticket = event.queryStringParameters?.ticket;
         if (!ticket) {
           return { statusCode: 401, body: "Missing ticket" };
@@ -65,12 +68,15 @@ export function createHandler(deps = {}) {
           return { statusCode: 401, body: "Expired ticket" };
         }
 
+        const clientType = oldItem.clientType === "simulator" ? "simulator" : "portal";
+
         await ddb.send(
           new PutCommand({
             TableName: CONN_TABLE,
             Item: {
               connectionId,
               agent: oldItem.agent || "unknown",
+              clientType,
               connectedAt: new Date(nowMs).toISOString(),
               ttl: Math.floor(nowMs / 1000) + CONNECTION_TTL_SECONDS,
             },
@@ -80,6 +86,9 @@ export function createHandler(deps = {}) {
       }
 
       if (routeKey === "$disconnect") {
+        if (!connectionId) {
+          return { statusCode: 200, body: "Disconnected" };
+        }
         await ddb.send(new DeleteCommand({ TableName: CONN_TABLE, Key: { connectionId } }));
         return { statusCode: 200, body: "Disconnected" };
       }
