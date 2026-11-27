@@ -213,4 +213,112 @@ test("POST /ws-ticket writes 60s one-time WSTICKET# with UUID-safe agent claim",
   assert.equal(body.expiresAt, 1732264260000);
   assert.equal(puts[0].Item.messageKey, "WSTICKET#11111111-2222-3333-4444-555555555555");
   assert.equal(puts[0].Item.agent, "agent.minh@omniinbox.local");
+  assert.equal(puts[0].Item.clientType, "portal");
+
+  const simRes = await handler({
+    httpMethod: "POST",
+    resource: "/ws-ticket",
+    body: JSON.stringify({ clientType: "simulator" }),
+    requestContext: { authorizer: { claims: { email: "agent.minh@omniinbox.local" } } },
+  });
+  assert.equal(simRes.statusCode, 200);
+  assert.equal(puts[1].Item.clientType, "simulator");
+});
+
+test("malformed percent encoding in conversationId returns 400 instead of 500", async () => {
+  const handler = createHandler({ ddbClient: { async send() { return {}; } } });
+  const res = await handler({
+    httpMethod: "GET",
+    resource: "/conversations/{conversationId}/messages",
+    pathParameters: { conversationId: "CONV%E0%A4%A" },
+  });
+  assert.equal(res.statusCode, 400);
+});
+
+test("PATCH enforces expectedLastMessageAt guard and CONVERSATION_UPDATED skips simulator connections", async () => {
+  const sentConnections = [];
+  const handler = createHandler({
+    env: { WS_ENDPOINT: "https://ws.example.com/prod" },
+    ddbClient: {
+      async send(cmd) {
+        if (cmd.constructor.name === "UpdateCommand") {
+          if (cmd.input.ConditionExpression.includes("lastMessageAt = :expectedLma")) {
+            const err = new Error("Stale");
+            err.name = "ConditionalCheckFailedException";
+            throw err;
+          }
+          return { Attributes: { conversationId: "CONV#telegram#1", status: "IN_PROGRESS", unreadCount: 0 } };
+        }
+        if (cmd.constructor.name === "GetCommand") {
+          return {
+            Item: {
+              conversationId: "CONV#telegram#1",
+              lastMessageAt: "2026-11-27T10:00:05.000Z",
+              unreadCount: 1,
+            },
+          };
+        }
+        if (cmd.constructor.name === "ScanCommand") {
+          return {
+            Items: [
+              { connectionId: "conn-portal", clientType: "portal" },
+              { connectionId: "conn-sim", clientType: "simulator" },
+            ],
+          };
+        }
+        return {};
+      },
+    },
+    createWsClient: () => ({
+      async send(cmd) {
+        sentConnections.push(cmd.input.ConnectionId);
+      },
+    }),
+  });
+
+  const stale = await handler({
+    httpMethod: "PATCH",
+    resource: "/conversations/{conversationId}",
+    pathParameters: { conversationId: "CONV%23telegram%231" },
+    body: JSON.stringify({ unreadCount: 0, expectedLastMessageAt: "2026-11-27T10:00:00.000Z" }),
+  });
+  assert.equal(stale.statusCode, 409);
+
+  const ok = await handler({
+    httpMethod: "PATCH",
+    resource: "/conversations/{conversationId}",
+    pathParameters: { conversationId: "CONV%23telegram%231" },
+    body: JSON.stringify({ status: "IN_PROGRESS" }),
+  });
+  assert.equal(ok.statusCode, 200);
+  assert.deepEqual(sentConnections, ["conn-portal"]);
+});
+
+test("filtered GET /conversations paginates bounded pages across empty FilterExpression slices", async () => {
+  let page = 0;
+  const handler = createHandler({
+    ddbClient: {
+      async send() {
+        page += 1;
+        if (page === 1) {
+          return { Items: [], LastEvaluatedKey: { conversationId: "c-page-1" } };
+        }
+        return {
+          Items: [{ conversationId: "CONV#telegram#2", gsi1pk: "CONV", channel: "telegram" }],
+          LastEvaluatedKey: undefined,
+        };
+      },
+    },
+  });
+
+  const res = await handler({
+    httpMethod: "GET",
+    resource: "/conversations",
+    queryStringParameters: { channel: "telegram", limit: "10" },
+  });
+  assert.equal(res.statusCode, 200);
+  const body = JSON.parse(res.body);
+  assert.equal(page, 2);
+  assert.equal(body.conversations.length, 1);
+  assert.equal(body.nextToken, null);
 });

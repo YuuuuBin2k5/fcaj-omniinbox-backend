@@ -22,7 +22,19 @@ import {
 
 const CONV_INDEX = "gsi-all-by-time";
 const STATUSES = ["OPEN", "IN_PROGRESS", "RESOLVED"];
+const MAX_FILTER_PAGES = 5;
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/**
+ * Extracts Cognito JWT claims across both API Gateway REST v1 and HTTP v2 authorizers.
+ */
+function getClaims(event = {}) {
+  return (
+    event.requestContext?.authorizer?.claims ||
+    event.requestContext?.authorizer?.jwt?.claims ||
+    {}
+  );
+}
 
 /**
  * Resolves a human-readable agent identifier from Cognito JWT claims.
@@ -43,6 +55,18 @@ class HttpError extends Error {
   }
 }
 
+function decodeConvId(raw) {
+  if (!raw) throw new HttpError(400, "Missing conversationId");
+  try {
+    const decoded = decodeURIComponent(raw);
+    if (!decoded) throw new HttpError(400, "Missing conversationId");
+    return decoded;
+  } catch (err) {
+    if (err instanceof HttpError) throw err;
+    throw new HttpError(400, "Invalid conversationId encoding");
+  }
+}
+
 const encodeToken = (key) =>
   key ? Buffer.from(JSON.stringify(key)).toString("base64url") : null;
 
@@ -57,12 +81,16 @@ function decodeToken(token) {
 
 const parseLimit = (v) => Math.min(Math.max(parseInt(v, 10) || 50, 1), 100);
 
-function parseBody(event) {
+function parseBody(event, allowEmpty = false) {
   try {
     const body = event.body ? JSON.parse(event.body) : {};
-    if (typeof body !== "object" || body === null || Array.isArray(body)) throw new Error();
+    if (typeof body !== "object" || body === null || Array.isArray(body)) {
+      if (allowEmpty) return {};
+      throw new Error();
+    }
     return body;
   } catch {
+    if (allowEmpty && !event.body) return {};
     throw new HttpError(400, "Invalid JSON body");
   }
 }
@@ -122,7 +150,9 @@ export function createHandler(deps = {}) {
       const res = await ddb.send(
         new ScanCommand({ TableName: CONN_TABLE, ExclusiveStartKey: lastKey })
       );
-      connections.push(...(res.Items || []));
+      for (const item of res.Items || []) {
+        if (item.clientType !== "simulator") connections.push(item);
+      }
       lastKey = res.LastEvaluatedKey;
     } while (lastKey);
 
@@ -159,30 +189,59 @@ export function createHandler(deps = {}) {
       values[":st"] = q.status;
     }
 
-    const res = await ddb.send(
-      new QueryCommand({
-        TableName: CONV_TABLE,
-        IndexName: CONV_INDEX,
-        KeyConditionExpression: "gsi1pk = :pk",
-        FilterExpression: filters.length ? filters.join(" AND ") : undefined,
-        ExpressionAttributeNames: Object.keys(names).length ? names : undefined,
-        ExpressionAttributeValues: values,
-        ScanIndexForward: false,
-        Limit: parseLimit(q.limit),
-        ExclusiveStartKey: decodeToken(q.nextToken),
-      })
-    );
+    const limit = parseLimit(q.limit);
+    let nextKey = decodeToken(q.nextToken);
+
+    if (filters.length === 0) {
+      const res = await ddb.send(
+        new QueryCommand({
+          TableName: CONV_TABLE,
+          IndexName: CONV_INDEX,
+          KeyConditionExpression: "gsi1pk = :pk",
+          ExpressionAttributeValues: values,
+          ScanIndexForward: false,
+          Limit: limit,
+          ExclusiveStartKey: nextKey,
+        })
+      );
+      return json(200, {
+        conversations: (res.Items || []).map(publicConversation),
+        nextToken: encodeToken(res.LastEvaluatedKey),
+      });
+    }
+
+    // With FilterExpression, DynamoDB applies Limit BEFORE filtering; loop bounded pages so matches fill cleanly.
+    const collected = [];
+    for (let page = 0; page < MAX_FILTER_PAGES && collected.length < limit; page += 1) {
+      const res = await ddb.send(
+        new QueryCommand({
+          TableName: CONV_TABLE,
+          IndexName: CONV_INDEX,
+          KeyConditionExpression: "gsi1pk = :pk",
+          FilterExpression: filters.join(" AND "),
+          ExpressionAttributeNames: names,
+          ExpressionAttributeValues: values,
+          ScanIndexForward: false,
+          Limit: limit,
+          ExclusiveStartKey: nextKey,
+        })
+      );
+      for (const item of res.Items || []) {
+        collected.push(publicConversation(item));
+      }
+      nextKey = res.LastEvaluatedKey;
+      if (!nextKey) break;
+    }
 
     return json(200, {
-      conversations: (res.Items || []).map(publicConversation),
-      nextToken: encodeToken(res.LastEvaluatedKey),
+      conversations: collected,
+      nextToken: encodeToken(nextKey),
     });
   }
 
   async function listMessages(event) {
     const q = event.queryStringParameters || {};
-    const convId = decodeURIComponent(event.pathParameters?.conversationId || "");
-    if (!convId) throw new HttpError(400, "Missing conversationId");
+    const convId = decodeConvId(event.pathParameters?.conversationId);
 
     const res = await ddb.send(
       new QueryCommand({
@@ -203,8 +262,7 @@ export function createHandler(deps = {}) {
   }
 
   async function patchConversation(event) {
-    const convId = decodeURIComponent(event.pathParameters?.conversationId || "");
-    if (!convId) throw new HttpError(400, "Missing conversationId");
+    const convId = decodeConvId(event.pathParameters?.conversationId);
     const body = parseBody(event);
 
     const updates = [];
@@ -235,6 +293,10 @@ export function createHandler(deps = {}) {
     if (body.expectedAssignedAgent !== undefined) {
       condition += " AND assignedAgent = :expected";
       values[":expected"] = String(body.expectedAssignedAgent);
+    }
+    if (body.expectedLastMessageAt !== undefined) {
+      condition += " AND lastMessageAt = :expectedLma";
+      values[":expectedLma"] = String(body.expectedLastMessageAt);
     }
 
     let updated;
@@ -279,7 +341,9 @@ export function createHandler(deps = {}) {
     const ticket = uuid();
     const nowMs = now();
     const expiresAt = nowMs + 60_000;
-    const claims = event.requestContext?.authorizer?.claims || {};
+    const claims = getClaims(event);
+    const body = parseBody(event, true);
+    const clientType = body.clientType === "simulator" ? "simulator" : "portal";
 
     await ddb.send(
       new PutCommand({
@@ -287,13 +351,14 @@ export function createHandler(deps = {}) {
         Item: {
           messageKey: `WSTICKET#${ticket}`,
           agent: resolveAgentId(claims),
+          clientType,
           expiresAt,
           ttl: Math.floor(nowMs / 1000) + 300,
         },
       })
     );
 
-    return json(200, { ticket, expiresAt });
+    return json(200, { ticket, expiresAt, clientType });
   }
 
   return async (event = {}) => {
