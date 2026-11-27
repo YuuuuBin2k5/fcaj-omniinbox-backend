@@ -1,9 +1,3 @@
-// AWS Lambda: omni-api-handler (Node.js 22.x - arm64 - 128MB - timeout 10s - role: omni-api-role)
-// Routes (Cognito Authorizer required):
-//   GET  /conversations
-//   GET  /conversations/{conversationId}/messages
-//   PATCH /conversations/{conversationId}
-//   POST /ws-ticket
 import { randomUUID } from "node:crypto";
 import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
 import {
@@ -25,9 +19,6 @@ const STATUSES = ["OPEN", "IN_PROGRESS", "RESOLVED"];
 const MAX_FILTER_PAGES = 5;
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
-/**
- * Extracts Cognito JWT claims across both API Gateway REST v1 and HTTP v2 authorizers.
- */
 function getClaims(event = {}) {
   return (
     event.requestContext?.authorizer?.claims ||
@@ -36,10 +27,7 @@ function getClaims(event = {}) {
   );
 }
 
-/**
- * Resolves a human-readable agent identifier from Cognito JWT claims.
- * Amendment #1: When Cognito generates a UUID cognito:username (Email sign-in), prefers email.
- */
+// Ưu tiên email khi Cognito sinh cognito:username dạng UUID (đăng nhập bằng email)
 export function resolveAgentId(claims = {}) {
   const username = claims["cognito:username"];
   const email = claims.email;
@@ -101,9 +89,6 @@ const publicConversation = (item) => {
   return rest;
 };
 
-/**
- * Factory for omni-api-handler allowing dependency injection in unit tests.
- */
 export function createHandler(deps = {}) {
   const env = deps.env || process.env;
   const ddb =
@@ -210,7 +195,7 @@ export function createHandler(deps = {}) {
       });
     }
 
-    // With FilterExpression, DynamoDB applies Limit BEFORE filtering; loop bounded pages so matches fill cleanly.
+    // DynamoDB áp dụng Limit trước FilterExpression nên cần lặp giới hạn số trang để đủ bản ghi khớp
     const collected = [];
     for (let page = 0; page < MAX_FILTER_PAGES && collected.length < limit; page += 1) {
       const res = await ddb.send(

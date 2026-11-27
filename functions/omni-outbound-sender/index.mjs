@@ -1,7 +1,3 @@
-// AWS Lambda: omni-outbound-sender (Node.js 22.x - arm64 - 256MB - timeout 15s - role: omni-outbound-role)
-// Route: POST /messages/reply (Cognito Authorizer required)
-// Includes atomic reply ownership guard (409 on unassigned race or foreign assignee), SSM 5m TTL cache,
-// Amendment #1 (UUID-safe agentId), #2 (FAILED / concurrent unreadCount), and #3 (strip gsi1pk + WS clientType isolation).
 import { randomUUID } from "node:crypto";
 import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
 import {
@@ -22,9 +18,6 @@ const MAX_CONTENT = 4000;
 const TOKEN_CACHE_TTL_MS = 5 * 60 * 1000;
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
-/**
- * Extracts Cognito JWT claims across both API Gateway REST v1 and HTTP v2 authorizers.
- */
 function getClaims(event = {}) {
   return (
     event.requestContext?.authorizer?.claims ||
@@ -33,10 +26,7 @@ function getClaims(event = {}) {
   );
 }
 
-/**
- * Resolves a human-readable agent identifier from Cognito JWT claims.
- * Amendment #1: When Cognito generates a UUID cognito:username (Email sign-in), prefers email.
- */
+// Ưu tiên email khi Cognito sinh cognito:username dạng UUID (đăng nhập bằng email)
 export function resolveAgentId(claims = {}) {
   const username = claims["cognito:username"];
   const email = claims.email;
@@ -50,9 +40,6 @@ const publicConversation = (item) => {
   return rest;
 };
 
-/**
- * Factory for omni-outbound-sender allowing dependency injection in unit tests.
- */
 export function createHandler(deps = {}) {
   const env = deps.env || process.env;
   const ddb =
@@ -115,7 +102,7 @@ export function createHandler(deps = {}) {
           new ScanCommand({ TableName: CONN_TABLE, ExclusiveStartKey: lastKey })
         );
         for (const item of res.Items || []) {
-          // Never push real Telegram outbound messages down Simulator-only connections
+          // Không đẩy tin outbound Telegram thật xuống kết nối WebSocket của Simulator
           if (isTelegram && item.clientType === "simulator") continue;
           connections.push(item);
         }
@@ -184,7 +171,7 @@ export function createHandler(deps = {}) {
       }
       return { ok: true };
     } catch (err) {
-      // Never leak raw error message/URL that might contain the bot token
+      // Không trả message/URL lỗi gốc vì có thể làm lộ Telegram bot token
       return { ok: false, uncertain: true, errorDetail: `Telegram delivery unconfirmed (${err.name})` };
     }
   }
@@ -194,11 +181,9 @@ export function createHandler(deps = {}) {
     if (method === "OPTIONS") return { statusCode: 200, headers: corsHeaders, body: "" };
 
     try {
-      // 1. Agent identity strictly from Cognito JWT
       const agentId = resolveAgentId(getClaims(event));
       if (!agentId) return respond(401, { error: "Unauthorized" });
 
-      // 2. Validate request body
       let body;
       try {
         body = event.body ? JSON.parse(event.body) : {};
@@ -225,7 +210,6 @@ export function createHandler(deps = {}) {
         return respond(400, { error: `Content exceeds ${MAX_CONTENT} chars` });
       }
 
-      // 3. Conversation MUST exist; derive channel & recipientId strictly on server
       let { Item: conv } = await ddb.send(
         new GetCommand({ TableName: CONV_TABLE, Key: { conversationId }, ConsistentRead: true })
       );
@@ -238,8 +222,7 @@ export function createHandler(deps = {}) {
         return respond(400, { error: "Corrupted conversation record" });
       }
 
-      // 4. Atomic reply ownership guard BEFORE dispatching external channel calls:
-      //    Prevents two agents from overlapping replies to the same unassigned/assigned customer.
+      // Chặn trước ở bước ghi nguyên tử để tránh hai nhân viên gửi trùng cho cùng một khách
       if (conv.assignedAgent && conv.assignedAgent !== "unassigned" && conv.assignedAgent !== agentId) {
         return respond(409, {
           error: "CONVERSATION_ASSIGNED_TO_OTHER",
@@ -283,7 +266,6 @@ export function createHandler(deps = {}) {
         }
       }
 
-      // 5. Retry validation: only FAILED OUTBOUND messages can be retried in place
       let existing = null;
       if (retryOfMessageId) {
         const { Item } = await ddb.send(
@@ -304,7 +286,6 @@ export function createHandler(deps = {}) {
         content = Item.content;
       }
 
-      // 6. Reserve the delivery in OmniMessages before calling Telegram.
       const startedMs = now();
       const deliveredVia = channel === "telegram" ? "telegram" : "simulator";
       const message = existing || {
@@ -386,10 +367,7 @@ export function createHandler(deps = {}) {
         })
       );
 
-      // 7. Update conversation safely (Amendments #2 & #3):
-      //    - On FAILED / UNKNOWN: preserve unreadCount, lastMessage, lastMessageAt, and OPEN status.
-      //    - On SENT: clear unreadCount ONLY if no newer inbound message arrived during delivery;
-      //      set lastMessageDirection = "OUTBOUND" when updating preview; advance OPEN -> IN_PROGRESS.
+      // Chỉ xóa unreadCount khi gửi thành công và không có tin inbound mới đến trong lúc đang gửi
       let latestConv = conv;
       try {
         if (status === "SENT") {
@@ -434,7 +412,7 @@ export function createHandler(deps = {}) {
             if (!currentConv) throw new Error("Conversation no longer exists");
             latestConv = currentConv;
 
-            // Newer inbound message arrived in-flight => update preview without clearing unreadCount
+            // Có tin inbound mới đến lúc đang gửi nên chỉ cập nhật xem trước, giữ nguyên unreadCount
             if (!existing && currentConv.lastMessageAt < nowIso) {
               const res = await ddb.send(
                 new UpdateCommand({
@@ -481,7 +459,6 @@ export function createHandler(deps = {}) {
         latestConv = null;
       }
 
-      // 8. Strip internal gsi1pk and broadcast best-effort
       const pubConv = publicConversation(latestConv);
       await broadcastToAgents({
         event: "OUTBOUND_MESSAGE",

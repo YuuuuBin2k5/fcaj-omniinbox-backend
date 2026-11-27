@@ -1,5 +1,3 @@
-// AWS Lambda: omni-webhook-ingest (Node.js 22.x - arm64 - 128MB - timeout 5s - role: omni-ingest-role)
-// Route: POST /webhook/{channel} (Public for Telegram verified via SSM secret header; Simulator gated by ALLOW_SIMULATOR and optional REQUIRE_SIMULATOR_AUTH)
 import { timingSafeEqual } from "node:crypto";
 import { SQSClient, SendMessageCommand } from "@aws-sdk/client-sqs";
 import { SSMClient, GetParameterCommand } from "@aws-sdk/client-ssm";
@@ -14,9 +12,6 @@ function safeEqual(a, b) {
   return ba.length === bb.length && timingSafeEqual(ba, bb);
 }
 
-/**
- * Extracts Cognito JWT claims across both API Gateway REST v1 and HTTP v2 authorizers.
- */
 function getAuthorizerClaims(event = {}) {
   return (
     event.requestContext?.authorizer?.claims ||
@@ -25,9 +20,6 @@ function getAuthorizerClaims(event = {}) {
   );
 }
 
-/**
- * Factory for omni-webhook-ingest allowing dependency injection in unit tests.
- */
 export function createHandler(deps = {}) {
   const env = deps.env || process.env;
   const sqs = deps.sqsClient || new SQSClient({});
@@ -71,13 +63,11 @@ export function createHandler(deps = {}) {
       return reply(200, {});
     }
 
-    // 1. Whitelist channel
     const channel = (event.pathParameters?.channel || "").toLowerCase();
     if (!ALLOWED_CHANNELS.includes(channel)) {
       return reply(404, { ok: false, error: "Unknown channel" });
     }
 
-    // 2. Source authentication
     if (channel === "telegram") {
       const headers = Object.fromEntries(
         Object.entries(event.headers || {}).map(([k, v]) => [k.toLowerCase(), v])
@@ -112,7 +102,6 @@ export function createHandler(deps = {}) {
       }
     }
 
-    // 3. Body size & JSON object validation
     const rawBody = event.isBase64Encoded
       ? Buffer.from(event.body || "", "base64").toString("utf8")
       : event.body || "";
@@ -137,7 +126,7 @@ export function createHandler(deps = {}) {
       return reply(500, { ok: false, error: "Queue not configured" });
     }
 
-    // 4. Assign receivedAt once (preserved across SQS retries) and enqueue
+    // Gán receivedAt một lần tại ingest để giữ nguyên mốc thời gian khi SQS thử lại
     const envelope = {
       channel,
       receivedAt: new Date(now()).toISOString(),
