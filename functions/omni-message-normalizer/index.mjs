@@ -1,5 +1,5 @@
-// AWS Lambda: omni-message-normalizer (Node.js 22.x - arm64 - 256MB - timeout 5s - role: omni-normalizer-role)
-// Trigger: SQS omni-inbound-queue (Batch size 5, Report batch item failures, Max concurrency 5)
+// AWS Lambda: omni-message-normalizer (Node.js 22.x - arm64 - 256MB - timeout 10s - role: omni-normalizer-role)
+// Trigger: SQS omni-inbound-queue (Batch size 5, Report batch item failures, Max concurrency 5, recommended visibility timeout 60s)
 import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
 import {
   DynamoDBDocumentClient,
@@ -15,8 +15,57 @@ import {
   PostToConnectionCommand,
 } from "@aws-sdk/client-apigatewaymanagementapi";
 
-const STALE_LOCK_MS = 40_000; // > SQS visibility timeout (30s)
+// Strictly greater than recommended Lambda timeout (10s) and strictly less than SQS visibility timeout (30s/60s).
+const STALE_LOCK_MS = 20_000;
 const MAX_CONTENT = 4000;
+
+/**
+ * Extracts text, media captions, or honest attachment placeholders from a Telegram Message object.
+ */
+function extractTelegramContent(msg = {}) {
+  if (typeof msg.text === "string" && msg.text.trim()) {
+    return { content: msg.text, mediaType: undefined };
+  }
+
+  let media = null;
+  if (Array.isArray(msg.photo) && msg.photo.length > 0) {
+    media = { mediaType: "photo", label: "Hình ảnh" };
+  } else if (msg.document) {
+    const fileName = String(msg.document.file_name || "").trim();
+    media = {
+      mediaType: "document",
+      label: fileName ? `Tệp: ${fileName}` : "Tệp đính kèm",
+    };
+  } else if (msg.voice) {
+    media = { mediaType: "voice", label: "Tin nhắn thoại" };
+  } else if (msg.audio) {
+    media = { mediaType: "audio", label: "Âm thanh" };
+  } else if (msg.video || msg.video_note) {
+    media = { mediaType: "video", label: "Video" };
+  } else if (msg.sticker) {
+    const emoji = msg.sticker.emoji ? ` ${msg.sticker.emoji}` : "";
+    media = { mediaType: "sticker", label: `Sticker${emoji}` };
+  } else if (msg.location) {
+    media = { mediaType: "location", label: "Vị trí" };
+  } else if (msg.contact) {
+    media = { mediaType: "contact", label: "Danh bạ" };
+  }
+
+  const caption = typeof msg.caption === "string" ? msg.caption.trim() : "";
+  if (media && caption) {
+    return { content: `[${media.label}] ${caption}`, mediaType: media.mediaType };
+  }
+  if (media) {
+    return {
+      content: `[Khách gửi ${media.label} — chưa hỗ trợ hiển thị media]`,
+      mediaType: media.mediaType,
+    };
+  }
+  if (caption) {
+    return { content: caption, mediaType: undefined };
+  }
+  return null;
+}
 
 /**
  * Normalizes Telegram or Simulator webhook payloads into OmniInbox canonical fields.
@@ -31,8 +80,11 @@ export function normalizeInboundPayload(channel, payload, receivedAt, env = proc
 
   if (channel === "telegram") {
     const msg = payload?.message;
-    if (!msg || typeof msg.text !== "string" || !msg.text.trim()) return { ignored: true };
-    if (msg.chat?.id === undefined || msg.message_id === undefined) return { ignored: true };
+    if (!msg || msg.chat?.id === undefined || msg.message_id === undefined) {
+      return { ignored: true };
+    }
+    const extracted = extractTelegramContent(msg);
+    if (!extracted) return { ignored: true };
 
     const chatId = String(msg.chat.id);
     const msgId = String(msg.message_id);
@@ -40,7 +92,14 @@ export function normalizeInboundPayload(channel, payload, receivedAt, env = proc
       `${msg.from?.first_name || ""} ${msg.from?.last_name || ""}`.trim() ||
       msg.from?.username ||
       `Telegram #${chatId}`;
-    const createdAtMs = msg.date ? Number(msg.date) * 1000 : receivedMs;
+    const rawDateSec = msg.date !== undefined ? Number(msg.date) : NaN;
+    const telegramDateSec = Number.isFinite(rawDateSec) ? rawDateSec : null;
+    const createdAtMs =
+      telegramDateSec !== null
+        ? Math.floor(receivedMs / 1000) === telegramDateSec
+          ? receivedMs
+          : telegramDateSec * 1000
+        : receivedMs;
 
     return {
       ignored: false,
@@ -48,11 +107,14 @@ export function normalizeInboundPayload(channel, payload, receivedAt, env = proc
       idempotencyKey: `telegram#${chatId}#${msgId}`,
       conversationId: `CONV#telegram#${chatId}`,
       createdAtMs,
+      receivedMs,
+      telegramDateSec,
       channel: "telegram",
       channelMessageId: msgId,
       senderId: chatId,
       senderName,
-      content: msg.text.slice(0, MAX_CONTENT),
+      content: extracted.content.slice(0, MAX_CONTENT),
+      mediaType: extracted.mediaType,
     };
   }
 
@@ -69,6 +131,8 @@ export function normalizeInboundPayload(channel, payload, receivedAt, env = proc
     idempotencyKey: `${channel}#${customerId}#${extMsgId}`,
     conversationId: `CONV#${channel}#${customerId}`,
     createdAtMs: receivedMs,
+    receivedMs,
+    telegramDateSec: null,
     channel,
     channelMessageId: extMsgId,
     senderId: customerId,
@@ -147,7 +211,10 @@ export function createHandler(deps = {}) {
       const res = await ddb.send(
         new ScanCommand({ TableName: CONN_TABLE, ExclusiveStartKey: lastKey })
       );
-      connections.push(...(res.Items || []));
+      // Never leak real/portal inbound messages down Simulator-only WebSocket connections.
+      for (const item of res.Items || []) {
+        if (item.clientType !== "simulator") connections.push(item);
+      }
       lastKey = res.LastEvaluatedKey;
     } while (lastKey);
 
@@ -188,30 +255,62 @@ export function createHandler(deps = {}) {
       return;
     }
 
-    const createdAt = new Date(norm.createdAtMs).toISOString();
-    const messageItem = {
-      conversationId: norm.conversationId,
-      messageId: `MSG#${String(norm.createdAtMs).padStart(13, "0")}#${norm.channelMessageId}`,
-      channel: norm.channel,
-      channelMessageId: norm.channelMessageId,
-      direction: "INBOUND",
-      senderId: norm.senderId,
-      senderName: norm.senderName,
-      content: norm.content,
-      status: "RECEIVED",
-      createdAt,
-      clientSentAtMs: norm.clientSentAtMs,
-    };
+    let finalMessageItem = null;
 
     // Recompute against the latest snapshot when another write changes the conversation.
     for (let attempt = 0; ; attempt += 1) {
-      const { Item: existing } = await ddb.send(new GetCommand({
-        TableName: CONV_TABLE,
-        Key: { conversationId: norm.conversationId },
-        ConsistentRead: true,
-      }));
-      const newer = !existing?.lastMessageAt || createdAt > existing.lastMessageAt
-        || (createdAt === existing.lastMessageAt && messageItem.messageId.localeCompare(existing.lastMessageId || "", "en", { numeric: true }) > 0);
+      const { Item: existing } = await ddb.send(
+        new GetCommand({
+          TableName: CONV_TABLE,
+          Key: { conversationId: norm.conversationId },
+          ConsistentRead: true,
+        })
+      );
+
+      let effectiveCreatedAtMs = norm.createdAtMs;
+      if (
+        norm.channel === "telegram" &&
+        norm.telegramDateSec !== null &&
+        existing?.lastMessageAt
+      ) {
+        const existingMs = Date.parse(existing.lastMessageAt);
+        if (
+          Number.isFinite(existingMs) &&
+          Math.floor(existingMs / 1000) === norm.telegramDateSec &&
+          norm.receivedMs >= existingMs &&
+          effectiveCreatedAtMs <= existingMs
+        ) {
+          effectiveCreatedAtMs = Math.min(
+            (norm.telegramDateSec + 1) * 1000 - 1,
+            Math.max(norm.createdAtMs, existingMs + 1)
+          );
+        }
+      }
+
+      const createdAt = new Date(effectiveCreatedAtMs).toISOString();
+      const messageItem = {
+        conversationId: norm.conversationId,
+        messageId: `MSG#${String(effectiveCreatedAtMs).padStart(13, "0")}#${norm.channelMessageId}`,
+        channel: norm.channel,
+        channelMessageId: norm.channelMessageId,
+        direction: "INBOUND",
+        senderId: norm.senderId,
+        senderName: norm.senderName,
+        content: norm.content,
+        mediaType: norm.mediaType,
+        status: "RECEIVED",
+        createdAt,
+        clientSentAtMs: norm.clientSentAtMs,
+      };
+      finalMessageItem = messageItem;
+
+      const newer =
+        !existing?.lastMessageAt ||
+        createdAt > existing.lastMessageAt ||
+        (createdAt === existing.lastMessageAt &&
+          messageItem.messageId.localeCompare(existing.lastMessageId || "", "en", { numeric: true }) >
+            0);
+
       const names = { "#st": "status" };
       const values = {
         ":pk": "CONV",
@@ -220,10 +319,18 @@ export function createHandler(deps = {}) {
         ":cname": norm.senderName,
         ":unassigned": "unassigned",
         ":one": 1,
-        ":st": !existing?.status || (newer && existing.status === "RESOLVED") ? "OPEN" : existing.status,
+        ":st":
+          !existing?.status || (newer && existing.status === "RESOLVED")
+            ? "OPEN"
+            : existing.status,
       };
+
       const conditions = [];
-      for (const [field, expression] of [["status", "#st"], ["lastMessageAt", "lastMessageAt"], ["lastMessageId", "lastMessageId"]]) {
+      for (const [field, expression] of [
+        ["status", "#st"],
+        ["lastMessageAt", "lastMessageAt"],
+        ["lastMessageId", "lastMessageId"],
+      ]) {
         if (existing?.[field] === undefined) {
           conditions.push(`attribute_not_exists(${expression})`);
         } else {
@@ -232,41 +339,59 @@ export function createHandler(deps = {}) {
           values[token] = existing[field];
         }
       }
-      const preview = newer ? ", lastMessage = :lm, lastMessageAt = :lma, lastMessageId = :lid" : "";
-      if (newer) Object.assign(values, { ":lm": norm.content, ":lma": createdAt, ":lid": messageItem.messageId });
+
+      const customerNameExpr = newer
+        ? "customerName = :cname"
+        : "customerName = if_not_exists(customerName, :cname)";
+      const preview = newer
+        ? ", lastMessage = :lm, lastMessageAt = :lma, lastMessageId = :lid, lastMessageDirection = :dir, lastInboundAt = :lma"
+        : "";
+      if (newer) {
+        Object.assign(values, {
+          ":lm": norm.content,
+          ":lma": createdAt,
+          ":lid": messageItem.messageId,
+          ":dir": "INBOUND",
+        });
+      }
 
       try {
-        await ddb.send(new TransactWriteCommand({
-          TransactItems: [
-            {
-              Put: {
-                TableName: MSG_TABLE,
-                Item: messageItem,
-                ConditionExpression: "attribute_not_exists(messageId)",
+        await ddb.send(
+          new TransactWriteCommand({
+            TransactItems: [
+              {
+                Put: {
+                  TableName: MSG_TABLE,
+                  Item: messageItem,
+                  ConditionExpression: "attribute_not_exists(messageId)",
+                },
               },
-            },
-            {
-              Update: {
-                TableName: CONV_TABLE,
-                Key: { conversationId: norm.conversationId },
-                UpdateExpression:
-                  "SET gsi1pk = :pk, channel = :c, customerId = if_not_exists(customerId, :cid), " +
-                  "customerName = if_not_exists(customerName, :cname), #st = :st, " +
-                  "assignedAgent = if_not_exists(assignedAgent, :unassigned)" + preview + " ADD unreadCount :one",
-                ConditionExpression: conditions.join(" AND "),
-                ExpressionAttributeNames: names,
-                ExpressionAttributeValues: values,
+              {
+                Update: {
+                  TableName: CONV_TABLE,
+                  Key: { conversationId: norm.conversationId },
+                  UpdateExpression:
+                    "SET gsi1pk = :pk, channel = :c, customerId = if_not_exists(customerId, :cid), " +
+                    `${customerNameExpr}, #st = :st, ` +
+                    "assignedAgent = if_not_exists(assignedAgent, :unassigned)" +
+                    preview +
+                    " ADD unreadCount :one",
+                  ConditionExpression: conditions.join(" AND "),
+                  ExpressionAttributeNames: names,
+                  ExpressionAttributeValues: values,
+                },
               },
-            },
-          ],
-        }));
+            ],
+          })
+        );
         break;
       } catch (err) {
         if (err.name !== "TransactionCanceledException") throw err;
         const [messageResult, conversationResult] = err.CancellationReasons || [];
         if (messageResult?.Code === "ConditionalCheckFailed") break;
-        const retryable = [messageResult, conversationResult].some((reason) => reason?.Code === "TransactionConflict")
-          || conversationResult?.Code === "ConditionalCheckFailed";
+        const retryable =
+          [messageResult, conversationResult].some((reason) => reason?.Code === "TransactionConflict") ||
+          conversationResult?.Code === "ConditionalCheckFailed";
         if (!retryable || attempt >= 2) throw err;
       }
     }
@@ -293,7 +418,7 @@ export function createHandler(deps = {}) {
       );
       if (conv) {
         const { gsi1pk, lastMessageId, ...conversation } = conv;
-        await broadcastToAgents({ event: "NEW_MESSAGE", conversation, message: messageItem });
+        await broadcastToAgents({ event: "NEW_MESSAGE", conversation, message: finalMessageItem });
       }
     } catch (err) {
       console.warn("Broadcast NEW_MESSAGE failed (ignored):", err.message);
