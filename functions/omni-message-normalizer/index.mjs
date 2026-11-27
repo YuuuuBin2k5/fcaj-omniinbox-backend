@@ -1,5 +1,3 @@
-// AWS Lambda: omni-message-normalizer (Node.js 22.x - arm64 - 256MB - timeout 10s - role: omni-normalizer-role)
-// Trigger: SQS omni-inbound-queue (Batch size 5, Report batch item failures, Max concurrency 5, recommended visibility timeout 60s)
 import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
 import {
   DynamoDBDocumentClient,
@@ -15,13 +13,10 @@ import {
   PostToConnectionCommand,
 } from "@aws-sdk/client-apigatewaymanagementapi";
 
-// Strictly greater than recommended Lambda timeout (10s) and strictly less than SQS visibility timeout (30s/60s).
+// Phải lớn hơn timeout Lambda (10s) và nhỏ hơn Visibility Timeout của SQS (30s/60s)
 const STALE_LOCK_MS = 20_000;
 const MAX_CONTENT = 4000;
 
-/**
- * Extracts text, media captions, or honest attachment placeholders from a Telegram Message object.
- */
 function extractTelegramContent(msg = {}) {
   if (typeof msg.text === "string" && msg.text.trim()) {
     return { content: msg.text, mediaType: undefined };
@@ -67,9 +62,6 @@ function extractTelegramContent(msg = {}) {
   return null;
 }
 
-/**
- * Normalizes Telegram or Simulator webhook payloads into OmniInbox canonical fields.
- */
 export function normalizeInboundPayload(channel, payload, receivedAt, env = process.env, now = Date.now) {
   if (env.ENABLE_FAULT_INJECTION === "true" && payload?.forceError === true) {
     throw new Error("SIMULATED_DLQ_ERROR: Malformed or corrupted channel payload!");
@@ -103,7 +95,7 @@ export function normalizeInboundPayload(channel, payload, receivedAt, env = proc
 
     return {
       ignored: false,
-      // message_id is only unique per chat => must include chat.id
+      // message_id chỉ duy nhất trong từng chat nên phải ghép cùng chat.id
       idempotencyKey: `telegram#${chatId}#${msgId}`,
       conversationId: `CONV#telegram#${chatId}`,
       createdAtMs,
@@ -142,9 +134,6 @@ export function normalizeInboundPayload(channel, payload, receivedAt, env = proc
   };
 }
 
-/**
- * Factory for omni-message-normalizer allowing dependency injection in unit tests.
- */
 export function createHandler(deps = {}) {
   const env = deps.env || process.env;
   const ddb =
@@ -211,7 +200,7 @@ export function createHandler(deps = {}) {
       const res = await ddb.send(
         new ScanCommand({ TableName: CONN_TABLE, ExclusiveStartKey: lastKey })
       );
-      // Never leak real/portal inbound messages down Simulator-only WebSocket connections.
+      // Không phát tin inbound thật xuống các kết nối WebSocket chỉ thuộc Simulator
       for (const item of res.Items || []) {
         if (item.clientType !== "simulator") connections.push(item);
       }
@@ -248,7 +237,6 @@ export function createHandler(deps = {}) {
 
     const nowMs = now();
 
-    // 1. Claim idempotency: PROCESSING -> DONE
     const claimResult = await claim(norm.idempotencyKey, nowMs);
     if (claimResult === "DUPLICATE") {
       console.log(`[IDEMPOTENCY] Duplicate message skipped: ${norm.idempotencyKey}`);
@@ -257,7 +245,7 @@ export function createHandler(deps = {}) {
 
     let finalMessageItem = null;
 
-    // Recompute against the latest snapshot when another write changes the conversation.
+    // Đọc lại snapshot mới nhất khi có luồng khác vừa cập nhật hội thoại
     for (let attempt = 0; ; attempt += 1) {
       const { Item: existing } = await ddb.send(
         new GetCommand({
@@ -396,7 +384,6 @@ export function createHandler(deps = {}) {
       }
     }
 
-    // 4. Mark DONE
     await ddb.send(
       new UpdateCommand({
         TableName: IDEM_TABLE,
@@ -407,7 +394,6 @@ export function createHandler(deps = {}) {
       })
     );
 
-    // 5. Re-read conversation and best-effort broadcast
     try {
       const { Item: conv } = await ddb.send(
         new GetCommand({
@@ -431,7 +417,7 @@ export function createHandler(deps = {}) {
       try {
         await processRecord(record);
       } catch (err) {
-        // Fixed prefix matched by CloudWatch Metric Filter Alarm
+        // Tiền tố cố định dùng cho CloudWatch Metric Filter kích hoạt cảnh báo DLQ
         console.error(`[NORMALIZER_FAILURE] record=${record.messageId} reason=${err.message}`);
         batchItemFailures.push({ itemIdentifier: record.messageId });
       }

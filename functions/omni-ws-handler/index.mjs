@@ -1,22 +1,14 @@
-// AWS Lambda: omni-ws-handler (Node.js 22.x - arm64 - 128MB - timeout 10s - role: omni-ws-role)
-// WebSocket API routes: $connect (one-time ticket verification), $disconnect, $default (ping/PONG)
 import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
 import { DynamoDBDocumentClient, PutCommand, DeleteCommand } from "@aws-sdk/lib-dynamodb";
 
-const CONNECTION_TTL_SECONDS = 3 * 60 * 60; // 3 hours (API Gateway max WS duration is 2h)
+const CONNECTION_TTL_SECONDS = 3 * 60 * 60; // Giới hạn kết nối WebSocket tối đa của API Gateway là 2 giờ
 
-/**
- * Normalizes epoch seconds or milliseconds to epoch milliseconds.
- */
 export function toMillis(value) {
   const n = Number(value);
   if (!Number.isFinite(n)) return 0;
   return n < 1e12 ? n * 1000 : n;
 }
 
-/**
- * Factory for omni-ws-handler allowing dependency injection in unit tests.
- */
 export function createHandler(deps = {}) {
   const env = deps.env || process.env;
   const ddb =
@@ -44,7 +36,7 @@ export function createHandler(deps = {}) {
           return { statusCode: 401, body: "Missing ticket" };
         }
 
-        // One-time ticket: atomically delete and inspect old record
+        // Xóa ngay khi đọc để đảm bảo mỗi ticket WebSocket chỉ dùng một lần
         let oldItem;
         try {
           const res = await ddb.send(
@@ -63,7 +55,7 @@ export function createHandler(deps = {}) {
           throw err;
         }
 
-        // Check expiration explicitly because DynamoDB TTL deletion can lag
+        // Kiểm tra hết hạn thủ công vì TTL của DynamoDB có thể xóa trễ
         if (!oldItem || toMillis(oldItem.expiresAt) <= nowMs) {
           return { statusCode: 401, body: "Expired ticket" };
         }
@@ -93,7 +85,6 @@ export function createHandler(deps = {}) {
         return { statusCode: 200, body: "Disconnected" };
       }
 
-      // $default (ping keepalive from frontend: {"action":"ping"})
       return { statusCode: 200, body: JSON.stringify({ event: "PONG" }) };
     } catch (err) {
       console.error("WebSocket Handler Error:", err);
