@@ -44,7 +44,7 @@ Mẫu đầy đủ lưu tại [.env.example](../.env.example). **Lưu ý quan tr
 
 ## 3. Thứ tự phối hợp triển khai trên AWS
 
-1. **Vi (Member 2):** Tạo trước 2 tham số SSM (`Standard`, `SecureString`), Cognito User Pool `omniinbox-agent-pool` (tắt self-registration, tạo 2 tài khoản bằng CLI với `--permanent`), và bộ 6+1 IAM Role.
+1. **Vi (Member 2):** Tạo trước 2 tham số SSM (`Standard`, `SecureString`), cấp quyền `ssm:GetParameter` trên `/omniinbox/prod/webhook_secret` cho Duy để chạy `setWebhook`, tạo AWS Budgets ($5/tháng), Cognito User Pool `omniinbox-agent-pool` (tắt self-registration, tạo 2 tài khoản bằng CLI với `--permanent`), và bộ 6+1 IAM Role.
 2. **Trung Nam (Member 5):** Tạo sẵn 6 CloudWatch Log Group `/aws/lambda/omni-*` với **retention `7 days` trước khi deploy Lambda** (nếu để Lambda tự tạo mặc định sẽ thành `Never expire`).
 3. **Hoài Nam (Member 3):** Tạo 4 bảng DynamoDB (kèm GSI `gsi-all-by-time` và bật TTL thuộc tính `ttl`), SQS + DLQ, deploy 3 Lambda (`ingest`, `normalizer`, `api`), dựng `OmniInbox-REST-API` stage `prod`, gắn **Cognito Authorizer bắt buộc cho cả 6 route nhân viên** (chỉ để public `POST /webhook/{channel}`), bật Gateway Responses `Default 4XX / 5XX` kèm CORS headers và throttling `20 rps / burst 40`.
    - *Bảo vệ hai lớp:* Ngoài Cognito Authorizer trên API Gateway, code `omni-api-handler` cũng tự kiểm tra JWT claims và trả `401` nếu route bị cấu hình thiếu Authorizer.

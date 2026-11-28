@@ -11,7 +11,7 @@ Trên Windows PowerShell, dùng `npm.cmd`:
 ```powershell
 npm.cmd install          # Cài @aws-sdk/* vào devDependencies để chạy unit test
 npm.cmd run verify       # Kiểm tra cú pháp ESM, import tự chứa, không lộ secret/model EOL
-npm.cmd test             # Chạy toàn bộ 45 unit test bằng node:test
+npm.cmd test             # Chạy toàn bộ 54 unit test bằng node:test
 npm.cmd run check        # Chạy liên hoàn cả verify và test (luôn chạy trước khi push PR)
 npm.cmd run package:core # Đóng gói 5 Lambda lõi -> dist/core/*.zip
 npm.cmd run package      # Đóng gói đủ 6 Lambda (gồm AI Pha 2) -> dist/all/*.zip
@@ -21,18 +21,20 @@ npm.cmd run package      # Đóng gói đủ 6 Lambda (gồm AI Pha 2) -> dist/a
 
 ---
 
-## 2. Danh sách 6 bộ Unit Test & Fixtures
+## 2. Danh sách 8 bộ Unit Test & Fixtures
 
-Các bài test dùng `createHandler(deps)` để mock DynamoDB, SQS, SSM, WebSocket và `fetch`:
+Các bài test dùng `createHandler(deps)` để mock DynamoDB, SQS, SSM, WebSocket và `fetch` (riêng 2 bộ cuối kiểm tra script đóng gói ZIP và mẫu SAM):
 
-| File test | Hàm kiểm thử | Số lượng test |
+| File test | Hàm / thành phần kiểm thử | Số lượng test |
 | :--- | :--- | :---: |
 | [tests/webhook-ingest.test.mjs](../tests/webhook-ingest.test.mjs) | `omni-webhook-ingest` (CORS, secret rotation, 64KB, base64, auth simulator) | 9 |
-| [tests/message-normalizer.test.mjs](../tests/message-normalizer.test.mjs) | `omni-message-normalizer` (media Telegram, idempotency 2 pha, reopen `OPEN`, CAS, DLQ fault) | 10 |
-| [tests/api-handler.test.mjs](../tests/api-handler.test.mjs) | `omni-api-handler` (UUID-safe agent, query GSI, filter paging, `PATCH` `409`, `ws-ticket`) | 9 |
+| [tests/message-normalizer.test.mjs](../tests/message-normalizer.test.mjs) | `omni-message-normalizer` (media Telegram, idempotency 2 pha, reopen `OPEN`, CAS, DLQ fault) | 11 |
+| [tests/api-handler.test.mjs](../tests/api-handler.test.mjs) | `omni-api-handler` (chặn `401` khi thiếu JWT claims, HTTP v2 `routeKey`, UUID-safe agent, query GSI, filter paging, `PATCH` `409`, `ws-ticket`) | 11 |
 | [tests/ws-handler.test.mjs](../tests/ws-handler.test.mjs) | `omni-ws-handler` (`$connect` ticket 1 lần, epoch s/ms, `clientType`, `$disconnect`, `PONG`) | 4 |
-| [tests/outbound-sender.test.mjs](../tests/outbound-sender.test.mjs) | `omni-outbound-sender` (khóa phân công `409`, `requestId` replay, retry `FAILED`, token refresh `401`, giữ `unreadCount`) | 10 |
-| [tests/ai-suggester.test.mjs](../tests/ai-suggester.test.mjs) | `omni-ai-suggester` (chặn XML injection `<>`, đọc 5 tin từ DB, fallback trung thực) | 3 |
+| [tests/outbound-sender.test.mjs](../tests/outbound-sender.test.mjs) | `omni-outbound-sender` (khóa phân công `409`, `requestId` replay, retry `FAILED`, lọc kết nối WS hết hạn TTL, giữ `lastMessageAt` khi đang gửi, token refresh `401`, giữ `unreadCount`) | 12 |
+| [tests/ai-suggester.test.mjs](../tests/ai-suggester.test.mjs) | `omni-ai-suggester` (chặn XML injection `<>`, đọc 5 tin từ DB, giải mã `isBase64Encoded`, fallback trung thực) | 4 |
+| [tests/package-lambdas.test.mjs](../tests/package-lambdas.test.mjs) | `scripts/package-lambdas.mjs` (nén `index.mjs` ở gốc `.zip`, quyền POSIX `0644`, gói `core`/`all`) | 2 |
+| [tests/infra-template.test.mjs](../tests/infra-template.test.mjs) | `infra/template.yaml` (kiểm tra cấu trúc SAM: 4 bảng DynamoDB, SQS/DLQ, 6 IAM Role, 5+1 Lambda, 2 Alarm, không lộ secret) | 1 |
 
 Dữ liệu mẫu đầu vào đặt tại [fixtures/telegramUpdate.json](../fixtures/telegramUpdate.json) và [fixtures/simulatorPayload.json](../fixtures/simulatorPayload.json).
 
