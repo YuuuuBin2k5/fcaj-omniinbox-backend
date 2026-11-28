@@ -100,3 +100,25 @@ test("returns honest fallback suggestions when BEDROCK_MODEL_ID is empty or Bedr
   assert.equal(bErr.source, "fallback");
   assert.equal(bErr.reason, "AccessDeniedException");
 });
+
+test("decodes base64Encoded body and accepts access-token username claim", async () => {
+  const handler = createHandler({
+    env: { BEDROCK_MODEL_ID: "" },
+    ddbClient: {
+      async send() {
+        return { Items: [{ direction: "INBOUND", content: "Alo" }] };
+      },
+    },
+  });
+
+  const payload = JSON.stringify({ conversationId: "CONV#telegram#678901234" });
+  const res = await handler({
+    httpMethod: "POST",
+    requestContext: { authorizer: { claims: { username: "agent.minh@omniinbox.local" } } },
+    isBase64Encoded: true,
+    body: Buffer.from(payload, "utf8").toString("base64"),
+  });
+
+  assert.equal(res.statusCode, 200);
+  assert.equal(JSON.parse(res.body).source, "fallback");
+});

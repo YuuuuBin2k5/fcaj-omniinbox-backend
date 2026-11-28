@@ -71,13 +71,16 @@ export function createHandler(deps = {}) {
         event.requestContext?.authorizer?.claims ||
         event.requestContext?.authorizer?.jwt?.claims ||
         {};
-      if (!claims["cognito:username"] && !claims.email) {
+      if (!claims["cognito:username"] && !claims.email && !claims.username && !claims.sub) {
         return respond(401, { error: "Unauthorized" });
       }
 
+      const rawBody = event.isBase64Encoded
+        ? Buffer.from(event.body || "", "base64").toString("utf8")
+        : event.body || "";
       let body;
       try {
-        body = event.body ? JSON.parse(event.body) : {};
+        body = rawBody ? JSON.parse(rawBody) : {};
       } catch {
         return respond(400, { error: "Invalid JSON" });
       }
