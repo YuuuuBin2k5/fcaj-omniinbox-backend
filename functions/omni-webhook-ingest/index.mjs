@@ -29,7 +29,7 @@ export function createHandler(deps = {}) {
   let cachedSecret = null;
   let cachedSecretAt = 0;
 
-  const allowedOrigin = env.ALLOWED_ORIGIN || "*";
+  const allowedOrigin = (env.ALLOWED_ORIGIN || "*").trim().replace(/\/+$/, "") || "*";
   const corsHeaders = {
     "Content-Type": "application/json",
     "Access-Control-Allow-Origin": allowedOrigin,
@@ -96,7 +96,7 @@ export function createHandler(deps = {}) {
       }
       if (env.REQUIRE_SIMULATOR_AUTH === "true") {
         const claims = getAuthorizerClaims(event);
-        if (!claims["cognito:username"] && !claims.email) {
+        if (!claims["cognito:username"] && !claims.email && !claims.username && !claims.sub) {
           return reply(401, { ok: false, error: "Simulator authentication required" });
         }
       }

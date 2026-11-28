@@ -47,7 +47,7 @@ export function createHandler(deps = {}) {
   const MSG_TABLE = env.MESSAGES_TABLE || "OmniMessages";
   // Phải cấu hình rõ MODEL_ID của Bedrock hoặc inference profile (không gán mặc định)
   const MODEL_ID = env.BEDROCK_MODEL_ID || "";
-  const ALLOWED_ORIGIN = env.ALLOWED_ORIGIN || "*";
+  const ALLOWED_ORIGIN = (env.ALLOWED_ORIGIN || "*").trim().replace(/\/+$/, "") || "*";
 
   const corsHeaders = {
     "Content-Type": "application/json",

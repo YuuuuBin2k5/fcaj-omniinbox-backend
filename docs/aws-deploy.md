@@ -33,7 +33,7 @@ Mẫu đầy đủ lưu tại [.env.example](../.env.example). **Lưu ý quan tr
 | `WEBHOOK_SECRET_SSM_PATH` | ✓ | | | | | | `/omniinbox/prod/webhook_secret` |
 | `TELEGRAM_TOKEN_SSM_PATH` | | | | | ✓ | | `/omniinbox/prod/telegram_bot_token` |
 | `WS_ENDPOINT` | | ✓ | ✓ | | ✓ | | `https://<WS_API_ID>.execute-api.ap-southeast-1.amazonaws.com/prod` |
-| `ALLOWED_ORIGIN` | ✓ | | ✓ | | ✓ | ✓ | `*` lúc dev; đổi thành `https://<CLOUDFRONT_DOMAIN>` khi lên S3/CloudFront |
+| `ALLOWED_ORIGIN` | ✓ | | ✓ | | ✓ | ✓ | `*` lúc dev; đổi thành `https://<CLOUDFRONT_DOMAIN>` khi lên S3/CloudFront *(không có dấu `/` ở cuối)* |
 | `ALLOW_SIMULATOR` | ✓ | | | | | | `"true"` khi demo Simulator; `"false"` khi tắt mô phỏng |
 | `REQUIRE_SIMULATOR_AUTH` | ✓ | | | | | | `"false"` mặc định; đặt `"true"` nếu gắn Cognito cho `/simulator/webhook/{channel}` |
 | `ENABLE_FAULT_INJECTION` | | ✓ | | | | | `"false"` mặc định; chỉ bật `"true"` lúc test DLQ rồi tắt lại ngay |
@@ -48,7 +48,7 @@ Mẫu đầy đủ lưu tại [.env.example](../.env.example). **Lưu ý quan tr
 2. **Trung Nam (Member 5):** Tạo sẵn 6 CloudWatch Log Group `/aws/lambda/omni-*` với **retention `7 days` trước khi deploy Lambda** (nếu để Lambda tự tạo mặc định sẽ thành `Never expire`).
 3. **Hoài Nam (Member 3):** Tạo 4 bảng DynamoDB (kèm GSI `gsi-all-by-time` và bật TTL thuộc tính `ttl`), SQS + DLQ, deploy 3 Lambda (`ingest`, `normalizer`, `api`), dựng `OmniInbox-REST-API` stage `prod`, gắn **Cognito Authorizer bắt buộc cho cả 6 route nhân viên** (chỉ để public `POST /webhook/{channel}`), bật Gateway Responses `Default 4XX / 5XX` kèm CORS headers và throttling `20 rps / burst 40`.
    - *Bảo vệ hai lớp:* Ngoài Cognito Authorizer trên API Gateway, code `omni-api-handler` cũng tự kiểm tra JWT claims và trả `401` nếu route bị cấu hình thiếu Authorizer.
-4. **Duy (Member 4):** Tạo Telegram Bot và tự nạp token vào SSM, deploy `omni-ws-handler` + `OmniInbox-WebSocket-API`, deploy `omni-outbound-sender`, chạy `setWebhook` kèm `secret_token`, dựng S3 Private + CloudFront OAC (custom error `403/404 -> /index.html`). Cập nhật `<WS_API_ID>` cho Vi sửa lại 3 IAM Role và cập nhật `ALLOWED_ORIGIN` sang domain CloudFront cho các HTTP Lambda.
+4. **Duy (Member 4):** Tạo Telegram Bot và tự nạp token vào SSM, deploy `omni-ws-handler` + `OmniInbox-WebSocket-API` (nhớ bật Route Response `$default` nếu muốn test `{"action":"ping"}` thấy `PONG` trên `wscat`), deploy `omni-outbound-sender`, chạy `setWebhook` kèm `secret_token`, dựng S3 Private + CloudFront OAC (custom error `403/404 -> /index.html`). Cập nhật `<WS_API_ID>` cho Vi sửa lại 3 IAM Role và cập nhật `ALLOWED_ORIGIN` sang domain CloudFront cho các HTTP Lambda.
 5. **Trung Nam & Cả nhóm (Ngày 8–9):** Bật access/execution log API Gateway, tạo Metric Filter `"[NORMALIZER_FAILURE]"` trên `/aws/lambda/omni-message-normalizer`, tạo 2 CloudWatch Alarm (`OmniInbox-DLQ-Messages-Alarm` và `OmniInbox-Normalizer-Failures-Alarm`) trỏ về SNS `omni-alert-topic` (`Missing data = notBreaching`), rồi họp chốt **Go/No-Go** phần AI Pha 2.
 
 ---

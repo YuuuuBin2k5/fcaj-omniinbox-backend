@@ -43,7 +43,7 @@ function makeDeps(overrides = {}) {
 }
 
 test("OPTIONS returns 200 with CORS headers", async () => {
-  const { deps } = makeDeps();
+  const { deps } = makeDeps({ env: { ALLOWED_ORIGIN: "https://portal.example.com/" } });
   const handler = createHandler(deps);
   const res = await handler({ httpMethod: "OPTIONS" });
   assert.equal(res.statusCode, 200);

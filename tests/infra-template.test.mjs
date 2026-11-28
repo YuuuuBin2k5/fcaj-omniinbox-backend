@@ -59,6 +59,10 @@ test("SAM infra/template.yaml has valid structure, 4 tables, SQS/DLQ, 6 IAM role
   assert.ok(yaml.includes('"[NORMALIZER_FAILURE]"'));
   assert.ok(yaml.includes("TreatMissingData: notBreaching"));
   assert.ok(yaml.includes("Condition: IsAiEnabled"));
+  assert.ok(yaml.includes("Path: /simulator/webhook/{channel}"));
+  assert.ok(yaml.includes("Type: AWS::ApiGatewayV2::RouteResponse"));
+  assert.ok(yaml.includes("RouteResponseSelectionExpression: $default"));
+  assert.ok(yaml.includes("bedrock:*::foundation-model/*"));
 
   // Đảm bảo không nhúng secret hay model đã ngừng hỗ trợ vào template
   assert.doesNotMatch(yaml, /\bAKIA[0-9A-Z]{16}\b/);

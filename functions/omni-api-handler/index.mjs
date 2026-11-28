@@ -110,7 +110,7 @@ export function createHandler(deps = {}) {
   const IDEM_TABLE = env.IDEMPOTENCY_TABLE || "OmniIdempotency";
   const CONN_TABLE = env.WS_CONNECTIONS_TABLE || "OmniWSConnections";
   const WS_ENDPOINT = env.WS_ENDPOINT || "";
-  const ALLOWED_ORIGIN = env.ALLOWED_ORIGIN || "*";
+  const ALLOWED_ORIGIN = (env.ALLOWED_ORIGIN || "*").trim().replace(/\/+$/, "") || "*";
 
   const corsHeaders = {
     "Content-Type": "application/json",
