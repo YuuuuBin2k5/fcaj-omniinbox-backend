@@ -1,0 +1,815 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  OmniInbox Backend (AWS First Cloud Journey) - kien truc Serverless Event-Driven
+  tai Region ap-southeast-1 (4 DynamoDB, SQS/DLQ, 5+1 Lambda, Cognito, REST + WS API, CloudWatch + SNS).
+  Luu y: 2 tham so SSM SecureString (/omniinbox/prod/webhook_secret va /omniinbox/prod/telegram_bot_token)
+  duoc tao ngoai template de khong bao gio luu secret trong IaC hay Git.
+
+Parameters:
+  AllowedOrigin:
+    Type: String
+    Default: "*"
+    Description: Domain frontend được phép gọi CORS (dev dùng "*", production đổi sang https://<CLOUDFRONT_DOMAIN>)
+  AllowSimulator:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: Bật hoặc tắt tiếp nhận các kênh mô phỏng (shopee, zalo, webchat)
+  RequireSimulatorAuth:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+    Description: Bắt buộc Cognito JWT cho webhook Simulator khi bật route /simulator/webhook/{channel}
+  NormalizerTimeoutSeconds:
+    Type: Number
+    Default: 10
+    AllowedValues: [5, 10]
+    Description: Timeout Lambda omni-message-normalizer (10s cho production, hoặc 5s nếu demo DLQ với visibility 30s)
+  InboundQueueVisibilitySeconds:
+    Type: Number
+    Default: 60
+    AllowedValues: [30, 60]
+    Description: SQS VisibilityTimeout (>= 6x timeout normalizer và > STALE_LOCK_MS 20s)
+  AlertEmail:
+    Type: String
+    Default: ""
+    Description: Email nhận cảnh báo từ SNS omni-alert-topic (để trống nếu chưa đăng ký subscription)
+  EnableAiFeature:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+    Description: Chỉ đặt "true" khi nhóm chốt Go AI Pha 2 ở Ngày 9
+  BedrockModelId:
+    Type: String
+    Default: ""
+    Description: Model ID hoặc Inference Profile ID đang ACTIVE trên Bedrock (không hard-code model đã EOL)
+  BedrockRegion:
+    Type: String
+    Default: "ap-southeast-1"
+    Description: Region gọi Amazon Bedrock Converse API
+  BedrockModelArn:
+    Type: String
+    Default: ""
+    Description: ARN của foundation-model hoặc inference-profile được phép InvokeModel (Pha 2)
+
+Conditions:
+  IsAiEnabled: !Equals [!Ref EnableAiFeature, "true"]
+  HasAlertEmail: !Not [!Equals [!Ref AlertEmail, ""]]
+  HasBedrockModelArn: !Not [!Equals [!Ref BedrockModelArn, ""]]
+
+Globals:
+  Function:
+    Runtime: nodejs22.x
+    Architectures:
+      - arm64
+    Handler: index.handler
+
+Resources:
+  # ============================================================================
+  # 1. Amazon DynamoDB (4 Bảng On-Demand + GSI + TTL)
+  # ============================================================================
+  ConversationsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: OmniConversations
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: conversationId
+          AttributeType: S
+        - AttributeName: gsi1pk
+          AttributeType: S
+        - AttributeName: lastMessageAt
+          AttributeType: S
+      KeySchema:
+        - AttributeName: conversationId
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: gsi-all-by-time
+          KeySchema:
+            - AttributeName: gsi1pk
+              KeyType: HASH
+            - AttributeName: lastMessageAt
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+
+  MessagesTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: OmniMessages
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: conversationId
+          AttributeType: S
+        - AttributeName: messageId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: conversationId
+          KeyType: HASH
+        - AttributeName: messageId
+          KeyType: RANGE
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+
+  IdempotencyTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: OmniIdempotency
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: messageKey
+          AttributeType: S
+      KeySchema:
+        - AttributeName: messageKey
+          KeyType: HASH
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+
+  WsConnectionsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: OmniWSConnections
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: connectionId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: connectionId
+          KeyType: HASH
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+
+  # ============================================================================
+  # 2. Amazon SQS & Dead-Letter Queue
+  # ============================================================================
+  InboundDlq:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: omni-inbound-dlq
+      VisibilityTimeout: !Ref InboundQueueVisibilitySeconds
+      MessageRetentionPeriod: 1209600
+
+  InboundQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: omni-inbound-queue
+      VisibilityTimeout: !Ref InboundQueueVisibilitySeconds
+      MessageRetentionPeriod: 345600
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt InboundDlq.Arn
+        maxReceiveCount: 5
+
+  # ============================================================================
+  # 3. Amazon Cognito User Pool (Tắt tự đăng ký, chỉ Admin tạo tài khoản)
+  # ============================================================================
+  AgentUserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: omniinbox-agent-pool
+      AdminCreateUserConfig:
+        AllowAdminCreateUserOnly: true
+      AutoVerifiedAttributes:
+        - email
+      UsernameAttributes:
+        - email
+
+  AgentUserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      ClientName: omniinbox-web-client
+      UserPoolId: !Ref AgentUserPool
+      GenerateSecret: false
+      ExplicitAuthFlows:
+        - ALLOW_USER_SRP_AUTH
+        - ALLOW_REFRESH_TOKEN_AUTH
+
+  # ============================================================================
+  # 4. CloudWatch Log Groups (Tạo sẵn với retention 7 ngày)
+  # ============================================================================
+  IngestLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /aws/lambda/omni-webhook-ingest
+      RetentionInDays: 7
+
+  NormalizerLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /aws/lambda/omni-message-normalizer
+      RetentionInDays: 7
+
+  ApiHandlerLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /aws/lambda/omni-api-handler
+      RetentionInDays: 7
+
+  WsHandlerLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /aws/lambda/omni-ws-handler
+      RetentionInDays: 7
+
+  OutboundSenderLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /aws/lambda/omni-outbound-sender
+      RetentionInDays: 7
+
+  AiSuggesterLogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: IsAiEnabled
+    Properties:
+      LogGroupName: /aws/lambda/omni-ai-suggester
+      RetentionInDays: 7
+
+  # ============================================================================
+  # 5. API Gateway REST & WebSocket
+  # ============================================================================
+  RestApi:
+    Type: AWS::Serverless::Api
+    Properties:
+      Name: OmniInbox-REST-API
+      StageName: prod
+      EndpointConfiguration: REGIONAL
+      MethodSettings:
+        - ResourcePath: "/*"
+          HttpMethod: "*"
+          ThrottlingRateLimit: 20
+          ThrottlingBurstLimit: 40
+      Cors:
+        AllowOrigin: !Sub "'${AllowedOrigin}'"
+        AllowHeaders: "'Content-Type,Authorization'"
+        AllowMethods: "'GET,POST,PATCH,OPTIONS'"
+      Auth:
+        DefaultAuthorizer: OmniCognitoAuth
+        AddDefaultAuthorizerToCorsPreflight: false
+        Authorizers:
+          OmniCognitoAuth:
+            UserPoolArn: !GetAtt AgentUserPool.Arn
+            Identity:
+              Header: Authorization
+      GatewayResponses:
+        DEFAULT_4XX:
+          ResponseParameters:
+            Headers:
+              Access-Control-Allow-Origin: !Sub "'${AllowedOrigin}'"
+              Access-Control-Allow-Headers: "'Content-Type,Authorization'"
+        DEFAULT_5XX:
+          ResponseParameters:
+            Headers:
+              Access-Control-Allow-Origin: !Sub "'${AllowedOrigin}'"
+              Access-Control-Allow-Headers: "'Content-Type,Authorization'"
+
+  WebSocketApi:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: OmniInbox-WebSocket-API
+      ProtocolType: WEBSOCKET
+      RouteSelectionExpression: "$request.body.action"
+
+  # ============================================================================
+  # 6. IAM Roles Least Privilege (1 Role riêng cho mỗi Lambda)
+  # ============================================================================
+  IngestRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: omni-ingest-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: omni-ingest-policy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: SendToInboundQueueOnly
+                Effect: Allow
+                Action:
+                  - sqs:SendMessage
+                Resource: !GetAtt InboundQueue.Arn
+              - Sid: ReadWebhookSecret
+                Effect: Allow
+                Action:
+                  - ssm:GetParameter
+                Resource: !Sub "arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/omniinbox/prod/webhook_secret"
+
+  NormalizerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: omni-normalizer-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: omni-normalizer-policy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: ConsumeInboundQueue
+                Effect: Allow
+                Action:
+                  - sqs:ReceiveMessage
+                  - sqs:DeleteMessage
+                  - sqs:GetQueueAttributes
+                Resource: !GetAtt InboundQueue.Arn
+              - Sid: ReadWriteCoreTables
+                Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                Resource:
+                  - !GetAtt IdempotencyTable.Arn
+                  - !GetAtt MessagesTable.Arn
+                  - !GetAtt ConversationsTable.Arn
+              - Sid: BroadcastConnectionsOnly
+                Effect: Allow
+                Action:
+                  - dynamodb:Scan
+                  - dynamodb:DeleteItem
+                Resource: !GetAtt WsConnectionsTable.Arn
+              - Sid: PushToWebSocketClients
+                Effect: Allow
+                Action:
+                  - execute-api:ManageConnections
+                Resource: !Sub "arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${WebSocketApi}/prod/POST/@connections/*"
+
+  ApiRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: omni-api-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: omni-api-policy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: ConversationsAndIndex
+                Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:Query
+                Resource:
+                  - !GetAtt ConversationsTable.Arn
+                  - !Sub "${ConversationsTable.Arn}/index/*"
+              - Sid: ReadMessageHistory
+                Effect: Allow
+                Action:
+                  - dynamodb:Query
+                Resource: !GetAtt MessagesTable.Arn
+              - Sid: IssueWebSocketTicket
+                Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                Resource: !GetAtt IdempotencyTable.Arn
+              - Sid: BroadcastConnectionsOnly
+                Effect: Allow
+                Action:
+                  - dynamodb:Scan
+                  - dynamodb:DeleteItem
+                Resource: !GetAtt WsConnectionsTable.Arn
+              - Sid: PushToWebSocketClients
+                Effect: Allow
+                Action:
+                  - execute-api:ManageConnections
+                Resource: !Sub "arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${WebSocketApi}/prod/POST/@connections/*"
+
+  WsRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: omni-ws-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: omni-ws-policy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: ManageConnectionRecords
+                Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:DeleteItem
+                Resource: !GetAtt WsConnectionsTable.Arn
+              - Sid: ConsumeWebSocketTicket
+                Effect: Allow
+                Action:
+                  - dynamodb:DeleteItem
+                Resource: !GetAtt IdempotencyTable.Arn
+
+  OutboundRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: omni-outbound-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: omni-outbound-policy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: ReadTelegramToken
+                Effect: Allow
+                Action:
+                  - ssm:GetParameter
+                Resource: !Sub "arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/omniinbox/prod/telegram_bot_token"
+              - Sid: ConversationsReadUpdate
+                Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:UpdateItem
+                Resource: !GetAtt ConversationsTable.Arn
+              - Sid: MessagesReadWrite
+                Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                Resource: !GetAtt MessagesTable.Arn
+              - Sid: BroadcastConnectionsOnly
+                Effect: Allow
+                Action:
+                  - dynamodb:Scan
+                  - dynamodb:DeleteItem
+                Resource: !GetAtt WsConnectionsTable.Arn
+              - Sid: PushToWebSocketClients
+                Effect: Allow
+                Action:
+                  - execute-api:ManageConnections
+                Resource: !Sub "arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${WebSocketApi}/prod/POST/@connections/*"
+
+  AiRole:
+    Type: AWS::IAM::Role
+    Condition: IsAiEnabled
+    Properties:
+      RoleName: omni-ai-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: omni-ai-policy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: ReadRecentMessages
+                Effect: Allow
+                Action:
+                  - dynamodb:Query
+                Resource: !GetAtt MessagesTable.Arn
+              - Sid: InvokeSelectedModelOnly
+                Effect: Allow
+                Action:
+                  - bedrock:InvokeModel
+                Resource: !If
+                  - HasBedrockModelArn
+                  - !Ref BedrockModelArn
+                  - !Sub "arn:${AWS::Partition}:bedrock:${BedrockRegion}::foundation-model/${BedrockModelId}"
+
+  # ============================================================================
+  # 7. 5 Hàm AWS Lambda Lõi + 1 Hàm AI Pha 2 Tùy chọn
+  # ============================================================================
+  WebhookIngestFunction:
+    Type: AWS::Serverless::Function
+    DependsOn: IngestLogGroup
+    Properties:
+      FunctionName: omni-webhook-ingest
+      CodeUri: ../functions/omni-webhook-ingest/
+      MemorySize: 128
+      Timeout: 5
+      Role: !GetAtt IngestRole.Arn
+      Environment:
+        Variables:
+          INBOUND_QUEUE_URL: !Ref InboundQueue
+          WEBHOOK_SECRET_SSM_PATH: /omniinbox/prod/webhook_secret
+          ALLOW_SIMULATOR: !Ref AllowSimulator
+          REQUIRE_SIMULATOR_AUTH: !Ref RequireSimulatorAuth
+          ALLOWED_ORIGIN: !Ref AllowedOrigin
+      Events:
+        WebhookPost:
+          Type: Api
+          Properties:
+            RestApiId: !Ref RestApi
+            Path: /webhook/{channel}
+            Method: post
+            Auth:
+              Authorizer: NONE
+
+  MessageNormalizerFunction:
+    Type: AWS::Serverless::Function
+    DependsOn: NormalizerLogGroup
+    Properties:
+      FunctionName: omni-message-normalizer
+      CodeUri: ../functions/omni-message-normalizer/
+      MemorySize: 256
+      Timeout: !Ref NormalizerTimeoutSeconds
+      Role: !GetAtt NormalizerRole.Arn
+      Environment:
+        Variables:
+          CONVERSATIONS_TABLE: !Ref ConversationsTable
+          MESSAGES_TABLE: !Ref MessagesTable
+          IDEMPOTENCY_TABLE: !Ref IdempotencyTable
+          WS_CONNECTIONS_TABLE: !Ref WsConnectionsTable
+          WS_ENDPOINT: !Sub "https://${WebSocketApi}.execute-api.${AWS::Region}.amazonaws.com/prod"
+          ENABLE_FAULT_INJECTION: "false"
+      Events:
+        InboundQueueTrigger:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt InboundQueue.Arn
+            BatchSize: 5
+            FunctionResponseTypes:
+              - ReportBatchItemFailures
+            ScalingConfig:
+              MaximumConcurrency: 5
+
+  ApiHandlerFunction:
+    Type: AWS::Serverless::Function
+    DependsOn: ApiHandlerLogGroup
+    Properties:
+      FunctionName: omni-api-handler
+      CodeUri: ../functions/omni-api-handler/
+      MemorySize: 128
+      Timeout: 10
+      Role: !GetAtt ApiRole.Arn
+      Environment:
+        Variables:
+          CONVERSATIONS_TABLE: !Ref ConversationsTable
+          MESSAGES_TABLE: !Ref MessagesTable
+          IDEMPOTENCY_TABLE: !Ref IdempotencyTable
+          WS_CONNECTIONS_TABLE: !Ref WsConnectionsTable
+          WS_ENDPOINT: !Sub "https://${WebSocketApi}.execute-api.${AWS::Region}.amazonaws.com/prod"
+          ALLOWED_ORIGIN: !Ref AllowedOrigin
+      Events:
+        ListConversations:
+          Type: Api
+          Properties:
+            RestApiId: !Ref RestApi
+            Path: /conversations
+            Method: get
+        ListMessages:
+          Type: Api
+          Properties:
+            RestApiId: !Ref RestApi
+            Path: /conversations/{conversationId}/messages
+            Method: get
+        PatchConversation:
+          Type: Api
+          Properties:
+            RestApiId: !Ref RestApi
+            Path: /conversations/{conversationId}
+            Method: patch
+        CreateWsTicket:
+          Type: Api
+          Properties:
+            RestApiId: !Ref RestApi
+            Path: /ws-ticket
+            Method: post
+
+  WsHandlerFunction:
+    Type: AWS::Serverless::Function
+    DependsOn: WsHandlerLogGroup
+    Properties:
+      FunctionName: omni-ws-handler
+      CodeUri: ../functions/omni-ws-handler/
+      MemorySize: 128
+      Timeout: 10
+      Role: !GetAtt WsRole.Arn
+      Environment:
+        Variables:
+          WS_CONNECTIONS_TABLE: !Ref WsConnectionsTable
+          IDEMPOTENCY_TABLE: !Ref IdempotencyTable
+
+  OutboundSenderFunction:
+    Type: AWS::Serverless::Function
+    DependsOn: OutboundSenderLogGroup
+    Properties:
+      FunctionName: omni-outbound-sender
+      CodeUri: ../functions/omni-outbound-sender/
+      MemorySize: 256
+      Timeout: 15
+      Role: !GetAtt OutboundRole.Arn
+      Environment:
+        Variables:
+          CONVERSATIONS_TABLE: !Ref ConversationsTable
+          MESSAGES_TABLE: !Ref MessagesTable
+          WS_CONNECTIONS_TABLE: !Ref WsConnectionsTable
+          WS_ENDPOINT: !Sub "https://${WebSocketApi}.execute-api.${AWS::Region}.amazonaws.com/prod"
+          TELEGRAM_TOKEN_SSM_PATH: /omniinbox/prod/telegram_bot_token
+          ALLOWED_ORIGIN: !Ref AllowedOrigin
+      Events:
+        ReplyMessage:
+          Type: Api
+          Properties:
+            RestApiId: !Ref RestApi
+            Path: /messages/reply
+            Method: post
+
+  AiSuggesterFunction:
+    Type: AWS::Serverless::Function
+    Condition: IsAiEnabled
+    DependsOn: AiSuggesterLogGroup
+    Properties:
+      FunctionName: omni-ai-suggester
+      CodeUri: ../functions/omni-ai-suggester/
+      MemorySize: 256
+      Timeout: 15
+      Role: !GetAtt AiRole.Arn
+      Environment:
+        Variables:
+          MESSAGES_TABLE: !Ref MessagesTable
+          BEDROCK_MODEL_ID: !Ref BedrockModelId
+          BEDROCK_REGION: !Ref BedrockRegion
+          ALLOWED_ORIGIN: !Ref AllowedOrigin
+      Events:
+        SuggestReplies:
+          Type: Api
+          Properties:
+            RestApiId: !Ref RestApi
+            Path: /ai/suggest
+            Method: post
+
+  # ============================================================================
+  # 8. WebSocket Integration, Routes & Stage prod
+  # ============================================================================
+  WebSocketIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref WebSocketApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !Sub "arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${WsHandlerFunction.Arn}/invocations"
+
+  WsConnectRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref WebSocketApi
+      RouteKey: $connect
+      AuthorizationType: NONE
+      Target: !Sub "integrations/${WebSocketIntegration}"
+
+  WsDisconnectRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref WebSocketApi
+      RouteKey: $disconnect
+      Target: !Sub "integrations/${WebSocketIntegration}"
+
+  WsDefaultRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref WebSocketApi
+      RouteKey: $default
+      Target: !Sub "integrations/${WebSocketIntegration}"
+
+  WebSocketStage:
+    Type: AWS::ApiGatewayV2::Stage
+    DependsOn:
+      - WsConnectRoute
+      - WsDisconnectRoute
+      - WsDefaultRoute
+    Properties:
+      ApiId: !Ref WebSocketApi
+      StageName: prod
+      AutoDeploy: true
+
+  WsInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref WsHandlerFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${WebSocketApi}/*"
+
+  # ============================================================================
+  # 9. Giám sát CloudWatch Alarms, Metric Filter & SNS
+  # ============================================================================
+  AlertTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: omni-alert-topic
+
+  AlertEmailSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: HasAlertEmail
+    Properties:
+      TopicArn: !Ref AlertTopic
+      Protocol: email
+      Endpoint: !Ref AlertEmail
+
+  NormalizerFailureMetricFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Ref NormalizerLogGroup
+      FilterName: NormalizerFailures
+      FilterPattern: '"[NORMALIZER_FAILURE]"'
+      MetricTransformations:
+        - MetricNamespace: OmniInbox
+          MetricName: NormalizerFailures
+          MetricValue: "1"
+          DefaultValue: 0
+
+  DlqAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: OmniInbox-DLQ-Messages-Alarm
+      AlarmDescription: Cảnh báo khi có tin nhắn lỗi rơi vào omni-inbound-dlq
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt InboundDlq.QueueName
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 1
+      DatapointsToAlarm: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlertTopic
+
+  NormalizerFailuresAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: OmniInbox-Normalizer-Failures-Alarm
+      AlarmDescription: Cảnh báo khi omni-message-normalizer ghi nhận lỗi xử lý bản ghi SQS
+      Namespace: OmniInbox
+      MetricName: NormalizerFailures
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      DatapointsToAlarm: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlertTopic
+
+Outputs:
+  RestApiUrl:
+    Description: URL gốc stage prod cho Frontend (VITE_REST_API_URL)
+    Value: !Sub "https://${RestApi}.execute-api.${AWS::Region}.amazonaws.com/prod"
+  WebSocketUrl:
+    Description: WebSocket URL cho Frontend (VITE_WS_URL)
+    Value: !Sub "wss://${WebSocketApi}.execute-api.${AWS::Region}.amazonaws.com/prod"
+  WebSocketManagementEndpoint:
+    Description: Endpoint Management API dạng https:// dùng cho biến WS_ENDPOINT của Lambda
+    Value: !Sub "https://${WebSocketApi}.execute-api.${AWS::Region}.amazonaws.com/prod"
+  CognitoUserPoolId:
+    Description: Cognito User Pool ID (VITE_COGNITO_USER_POOL_ID)
+    Value: !Ref AgentUserPool
+  CognitoAppClientId:
+    Description: Cognito App Client ID (VITE_COGNITO_CLIENT_ID)
+    Value: !Ref AgentUserPoolClient
+  InboundQueueUrl:
+    Description: URL hàng đợi chính omni-inbound-queue
+    Value: !Ref InboundQueue
+  InboundDlqUrl:
+    Description: URL hàng đợi lỗi omni-inbound-dlq
+    Value: !Ref InboundDlq

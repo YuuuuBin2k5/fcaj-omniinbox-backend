@@ -1,6 +1,6 @@
 # Hướng dẫn Triển khai AWS, IAM Policies & Vận hành (`aws-deploy.md`)
 
-Tài liệu tham chiếu thông số chuẩn khi tạo tài nguyên và gắn code backend lên AWS (`ap-southeast-1`).
+Tài liệu tham chiếu thông số chuẩn khi tạo tài nguyên và gắn code backend lên AWS (`ap-southeast-1`). Nhóm có thể đối chiếu hoặc triển khai bằng mẫu AWS SAM tại [infra/template.yaml](../infra/template.yaml) (`sam validate` / `sam deploy --guided`, không lưu sẵn secret SSM).
 
 ---
 

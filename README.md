@@ -65,5 +65,7 @@ Các quy ước làm việc, kiến trúc, thiết kế bảng DynamoDB, đặc 
 | [docs/architecture.md](./docs/architecture.md) | Sơ đồ Serverless, 3 luồng xử lý chính và các lựa chọn kỹ thuật |
 | [docs/database-schema.md](./docs/database-schema.md) | Cấu trúc 4 bảng DynamoDB, khóa chống trùng và xử lý đồng thời |
 | [docs/api-spec.md](./docs/api-spec.md) | Đặc tả 7 REST API, WebSocket, 3 Realtime Events và mã lỗi |
-| [docs/setup-and-test.md](./docs/setup-and-test.md) | Chạy local, 45 unit test, đóng gói ZIP và lệnh `curl`/`wscat` test AWS |
+| [docs/setup-and-test.md](./docs/setup-and-test.md) | Chạy local, unit test, đóng gói ZIP và lệnh `curl`/`wscat` test AWS |
 | [docs/aws-deploy.md](./docs/aws-deploy.md) | Thông số Lambda, bảng Env Vars, 6 IAM Policy, Alarm và Clean-up |
+
+- **IaC tham chiếu (`infra/`):** File [infra/template.yaml](./infra/template.yaml) mô tả trọn bộ hạ tầng AWS SAM (`4` bảng DynamoDB, SQS/DLQ, Cognito, `5+1` Lambda, `6` IAM Role, REST + WebSocket API, CloudWatch Logs 7 ngày & 2 Alarm) khớp với cấu hình Console của nhóm (`NormalizerTimeoutSeconds=10`, `InboundQueueVisibilitySeconds=60` mặc định; có thể đổi sang `5`/`30` khi test DLQ).
