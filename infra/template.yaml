@@ -509,8 +509,9 @@ Resources:
                   - bedrock:InvokeModel
                 Resource: !If
                   - HasBedrockModelArn
-                  - !Ref BedrockModelArn
-                  - !Sub "arn:${AWS::Partition}:bedrock:${BedrockRegion}::foundation-model/${BedrockModelId}"
+                  - - !Ref BedrockModelArn
+                    - !Sub "arn:${AWS::Partition}:bedrock:*::foundation-model/*"
+                  - - !Sub "arn:${AWS::Partition}:bedrock:${BedrockRegion}::foundation-model/${BedrockModelId}"
 
   # ============================================================================
   # 7. 5 Hàm AWS Lambda Lõi + 1 Hàm AI Pha 2 Tùy chọn
@@ -540,6 +541,12 @@ Resources:
             Method: post
             Auth:
               Authorizer: NONE
+        SimulatorWebhookPost:
+          Type: Api
+          Properties:
+            RestApiId: !Ref RestApi
+            Path: /simulator/webhook/{channel}
+            Method: post
 
   MessageNormalizerFunction:
     Type: AWS::Serverless::Function
@@ -705,7 +712,15 @@ Resources:
     Properties:
       ApiId: !Ref WebSocketApi
       RouteKey: $default
+      RouteResponseSelectionExpression: $default
       Target: !Sub "integrations/${WebSocketIntegration}"
+
+  WsDefaultRouteResponse:
+    Type: AWS::ApiGatewayV2::RouteResponse
+    Properties:
+      ApiId: !Ref WebSocketApi
+      RouteId: !Ref WsDefaultRoute
+      RouteResponseKey: $default
 
   WebSocketStage:
     Type: AWS::ApiGatewayV2::Stage
@@ -713,6 +728,7 @@ Resources:
       - WsConnectRoute
       - WsDisconnectRoute
       - WsDefaultRoute
+      - WsDefaultRouteResponse
     Properties:
       ApiId: !Ref WebSocketApi
       StageName: prod

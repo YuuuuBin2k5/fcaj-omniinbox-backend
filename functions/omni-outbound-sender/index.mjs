@@ -60,7 +60,7 @@ export function createHandler(deps = {}) {
   const CONN_TABLE = env.WS_CONNECTIONS_TABLE || "OmniWSConnections";
   const WS_ENDPOINT = env.WS_ENDPOINT || "";
   const SSM_PATH = env.TELEGRAM_TOKEN_SSM_PATH || "/omniinbox/prod/telegram_bot_token";
-  const ALLOWED_ORIGIN = env.ALLOWED_ORIGIN || "*";
+  const ALLOWED_ORIGIN = (env.ALLOWED_ORIGIN || "*").trim().replace(/\/+$/, "") || "*";
 
   const corsHeaders = {
     "Content-Type": "application/json",
