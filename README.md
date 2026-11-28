@@ -52,3 +52,18 @@ npm.cmd run package:core  # Tạo 5 file ZIP chuẩn POSIX cho 5 Lambda lõi tro
 - **Trung Nam (Member 5 — Observability):** Tạo **TRƯỚC** Log Group `/aws/lambda/omni-*` với **retention 7 ngày**; tạo 2 Alarm (`DLQ >= 1` và metric filter `[NORMALIZER_FAILURE]`).
 - **Hoài Nam (Member 3 — Inbound & REST):** Tạo 4 bảng DynamoDB (`OmniConversations` + GSI `gsi-all-by-time`, `OmniMessages`, `OmniIdempotency` TTL, `OmniWSConnections` TTL), SQS + DLQ (khuyến nghị `60s` / `maxReceiveCount=5`), deploy 3 Lambda từ `fcaj-omniinbox-backend` (`main`), REST API Gateway + Cognito Authorizer + Gateway Responses CORS + throttling `20/40`.
 - **Duy (Member 4 — WS, Outbound & Hosting):** Tạo Telegram Bot và tự nạp token vào SSM, deploy `omni-ws-handler` + `omni-outbound-sender` từ `fcaj-omniinbox-backend` (`main`), chạy `setWebhook` kèm `secret_token`, và tạo S3 private + CloudFront OAC (custom error `403/404 -> /index.html`). Cập nhật `ALLOWED_ORIGIN` sang domain CloudFront.
+
+---
+
+## 5. Tài liệu chi tiết trong `docs/`
+
+Các quy ước làm việc, kiến trúc, thiết kế bảng DynamoDB, đặc tả API và hướng dẫn triển khai được tách gọn trong [docs/README.md](./docs/README.md):
+
+| Tài liệu | Nội dung |
+| :--- | :--- |
+| [docs/team-conventions.md](./docs/team-conventions.md) | Quy ước Git/PR, chuẩn viết code Lambda và phân công nhóm |
+| [docs/architecture.md](./docs/architecture.md) | Sơ đồ Serverless, 3 luồng xử lý chính và các lựa chọn kỹ thuật |
+| [docs/database-schema.md](./docs/database-schema.md) | Cấu trúc 4 bảng DynamoDB, khóa chống trùng và xử lý đồng thời |
+| [docs/api-spec.md](./docs/api-spec.md) | Đặc tả 7 REST API, WebSocket, 3 Realtime Events và mã lỗi |
+| [docs/setup-and-test.md](./docs/setup-and-test.md) | Chạy local, 45 unit test, đóng gói ZIP và lệnh `curl`/`wscat` test AWS |
+| [docs/aws-deploy.md](./docs/aws-deploy.md) | Thông số Lambda, bảng Env Vars, 6 IAM Policy, Alarm và Clean-up |
