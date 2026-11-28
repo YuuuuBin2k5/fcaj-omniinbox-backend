@@ -193,6 +193,7 @@ export function createHandler(deps = {}) {
     if (!WS_ENDPOINT) return;
     wsClient ??= createWsClient(WS_ENDPOINT);
     const data = Buffer.from(JSON.stringify(payload));
+    const nowSec = Math.floor(now() / 1000);
 
     const connections = [];
     let lastKey;
@@ -202,7 +203,10 @@ export function createHandler(deps = {}) {
       );
       // Không phát tin inbound thật xuống các kết nối WebSocket chỉ thuộc Simulator
       for (const item of res.Items || []) {
-        if (item.clientType !== "simulator") connections.push(item);
+        if (item.clientType === "simulator") continue;
+        // Bỏ qua kết nối đã quá hạn TTL vì DynamoDB có thể xóa chậm
+        if (Number.isFinite(item.ttl) && item.ttl <= nowSec) continue;
+        connections.push(item);
       }
       lastKey = res.LastEvaluatedKey;
     } while (lastKey);
@@ -214,7 +218,11 @@ export function createHandler(deps = {}) {
             new PostToConnectionCommand({ ConnectionId: connectionId, Data: data })
           );
         } catch (err) {
-          if (err.name === "GoneException" || err.$metadata?.httpStatusCode === 410) {
+          if (
+            err.name === "GoneException" ||
+            err.statusCode === 410 ||
+            err.$metadata?.httpStatusCode === 410
+          ) {
             await ddb.send(new DeleteCommand({ TableName: CONN_TABLE, Key: { connectionId } }));
           } else {
             console.warn(`Broadcast to ${connectionId} failed:`, err.message);

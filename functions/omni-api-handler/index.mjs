@@ -32,7 +32,7 @@ export function resolveAgentId(claims = {}) {
   const username = claims["cognito:username"];
   const email = claims.email;
   if (username && !UUID_RE.test(username)) return username;
-  return email || username || "unknown";
+  return email || username || claims.username || claims.sub || null;
 }
 
 class HttpError extends Error {
@@ -70,15 +70,18 @@ function decodeToken(token) {
 const parseLimit = (v) => Math.min(Math.max(parseInt(v, 10) || 50, 1), 100);
 
 function parseBody(event, allowEmpty = false) {
+  const rawBody = event.isBase64Encoded
+    ? Buffer.from(event.body || "", "base64").toString("utf8")
+    : event.body || "";
   try {
-    const body = event.body ? JSON.parse(event.body) : {};
+    const body = rawBody ? JSON.parse(rawBody) : {};
     if (typeof body !== "object" || body === null || Array.isArray(body)) {
       if (allowEmpty) return {};
       throw new Error();
     }
     return body;
   } catch {
-    if (allowEmpty && !event.body) return {};
+    if (allowEmpty && !rawBody) return {};
     throw new HttpError(400, "Invalid JSON body");
   }
 }
@@ -128,6 +131,7 @@ export function createHandler(deps = {}) {
     if (!WS_ENDPOINT) return;
     wsClient ??= createWsClient(WS_ENDPOINT);
     const data = Buffer.from(JSON.stringify(payload));
+    const nowSec = Math.floor(now() / 1000);
 
     const connections = [];
     let lastKey;
@@ -136,7 +140,10 @@ export function createHandler(deps = {}) {
         new ScanCommand({ TableName: CONN_TABLE, ExclusiveStartKey: lastKey })
       );
       for (const item of res.Items || []) {
-        if (item.clientType !== "simulator") connections.push(item);
+        if (item.clientType === "simulator") continue;
+        // Bỏ qua kết nối đã quá hạn TTL vì DynamoDB có thể xóa chậm
+        if (Number.isFinite(item.ttl) && item.ttl <= nowSec) continue;
+        connections.push(item);
       }
       lastKey = res.LastEvaluatedKey;
     } while (lastKey);
@@ -148,8 +155,14 @@ export function createHandler(deps = {}) {
             new PostToConnectionCommand({ ConnectionId: connectionId, Data: data })
           );
         } catch (err) {
-          if (err.name === "GoneException" || err.$metadata?.httpStatusCode === 410) {
+          if (
+            err.name === "GoneException" ||
+            err.statusCode === 410 ||
+            err.$metadata?.httpStatusCode === 410
+          ) {
             await ddb.send(new DeleteCommand({ TableName: CONN_TABLE, Key: { connectionId } }));
+          } else {
+            console.warn(`Broadcast to ${connectionId} failed:`, err.message);
           }
         }
       })
@@ -262,7 +275,7 @@ export function createHandler(deps = {}) {
     }
     if (body.assignedAgent !== undefined) {
       const agent = typeof body.assignedAgent === "string" ? body.assignedAgent.trim() : "";
-      if (!agent || agent.length > 50) throw new HttpError(400, "Invalid assignedAgent");
+      if (!agent || agent.length > 128) throw new HttpError(400, "Invalid assignedAgent");
       updates.push("assignedAgent = :ag");
       values[":ag"] = agent;
     }
@@ -322,11 +335,10 @@ export function createHandler(deps = {}) {
     return json(200, { conversation });
   }
 
-  async function createWsTicket(event) {
+  async function createWsTicket(event, agentId) {
     const ticket = uuid();
     const nowMs = now();
     const expiresAt = nowMs + 60_000;
-    const claims = getClaims(event);
     const body = parseBody(event, true);
     const clientType = body.clientType === "simulator" ? "simulator" : "portal";
 
@@ -335,7 +347,7 @@ export function createHandler(deps = {}) {
         TableName: IDEM_TABLE,
         Item: {
           messageKey: `WSTICKET#${ticket}`,
-          agent: resolveAgentId(claims),
+          agent: agentId,
           clientType,
           expiresAt,
           ttl: Math.floor(nowMs / 1000) + 300,
@@ -348,19 +360,29 @@ export function createHandler(deps = {}) {
 
   return async (event = {}) => {
     const method = (event.httpMethod || event.requestContext?.http?.method || "").toUpperCase();
-    const resource = event.resource || event.path || "";
+    const routeResource =
+      event.resource ||
+      (typeof event.routeKey === "string" ? event.routeKey.split(" ").slice(1).join(" ") : "") ||
+      event.path ||
+      "";
 
     if (method === "OPTIONS") return json(200, {});
 
+    // Chặn fail-closed phòng trường hợp route API Gateway thiếu gắn Cognito Authorizer
+    const agentId = resolveAgentId(getClaims(event));
+    if (!agentId) return json(401, { error: "Unauthorized" });
+
     try {
-      if (method === "GET" && resource === "/conversations") return await listConversations(event);
-      if (method === "GET" && resource === "/conversations/{conversationId}/messages") {
+      if (method === "GET" && routeResource === "/conversations") return await listConversations(event);
+      if (method === "GET" && routeResource === "/conversations/{conversationId}/messages") {
         return await listMessages(event);
       }
-      if (method === "PATCH" && resource === "/conversations/{conversationId}") {
+      if (method === "PATCH" && routeResource === "/conversations/{conversationId}") {
         return await patchConversation(event);
       }
-      if (method === "POST" && resource === "/ws-ticket") return await createWsTicket(event);
+      if (method === "POST" && routeResource === "/ws-ticket") {
+        return await createWsTicket(event, agentId);
+      }
 
       return json(404, { error: "Route not found" });
     } catch (err) {

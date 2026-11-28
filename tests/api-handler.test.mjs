@@ -2,6 +2,10 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { createHandler, resolveAgentId } from "../functions/omni-api-handler/index.mjs";
 
+const AUTH_CONTEXT = {
+  authorizer: { claims: { email: "agent.minh@omniinbox.local" } },
+};
+
 test("resolveAgentId prefers email when Cognito generates a UUID cognito:username", () => {
   assert.equal(
     resolveAgentId({
@@ -46,6 +50,7 @@ test("GET /conversations queries gsi-all-by-time, strips gsi1pk, and returns nex
   const res = await handler({
     httpMethod: "GET",
     resource: "/conversations",
+    requestContext: AUTH_CONTEXT,
     queryStringParameters: { channel: "Telegram", status: "OPEN", limit: "25" },
   });
 
@@ -78,6 +83,7 @@ test("GET /conversations/{conversationId}/messages decodes %23 and reverses newe
   const res = await handler({
     httpMethod: "GET",
     resource: "/conversations/{conversationId}/messages",
+    requestContext: AUTH_CONTEXT,
     pathParameters: { conversationId: "CONV%23telegram%231" },
   });
 
@@ -119,6 +125,7 @@ test("PATCH /conversations/{id} returns 409 with current conversation (without g
   const res = await handler({
     httpMethod: "PATCH",
     resource: "/conversations/{conversationId}",
+    requestContext: AUTH_CONTEXT,
     pathParameters: { conversationId: "CONV%23shopee%23u1" },
     body: JSON.stringify({
       assignedAgent: "agent.minh@omniinbox.local",
@@ -164,6 +171,7 @@ test("PATCH validates bad payload and broadcasts CONVERSATION_UPDATED on success
   const bad = await handler({
     httpMethod: "PATCH",
     resource: "/conversations/{conversationId}",
+    requestContext: AUTH_CONTEXT,
     pathParameters: { conversationId: "CONV#shopee#u1" },
     body: JSON.stringify({ status: "BOGUS" }),
   });
@@ -172,6 +180,7 @@ test("PATCH validates bad payload and broadcasts CONVERSATION_UPDATED on success
   const ok = await handler({
     httpMethod: "PATCH",
     resource: "/conversations/{conversationId}",
+    requestContext: AUTH_CONTEXT,
     pathParameters: { conversationId: "CONV#shopee#u1" },
     body: JSON.stringify({ status: "RESOLVED" }),
   });
@@ -230,6 +239,7 @@ test("malformed percent encoding in conversationId returns 400 instead of 500", 
   const res = await handler({
     httpMethod: "GET",
     resource: "/conversations/{conversationId}/messages",
+    requestContext: AUTH_CONTEXT,
     pathParameters: { conversationId: "CONV%E0%A4%A" },
   });
   assert.equal(res.statusCode, 400);
@@ -279,6 +289,7 @@ test("PATCH enforces expectedLastMessageAt guard and CONVERSATION_UPDATED skips 
   const stale = await handler({
     httpMethod: "PATCH",
     resource: "/conversations/{conversationId}",
+    requestContext: AUTH_CONTEXT,
     pathParameters: { conversationId: "CONV%23telegram%231" },
     body: JSON.stringify({ unreadCount: 0, expectedLastMessageAt: "2026-11-27T10:00:00.000Z" }),
   });
@@ -287,6 +298,7 @@ test("PATCH enforces expectedLastMessageAt guard and CONVERSATION_UPDATED skips 
   const ok = await handler({
     httpMethod: "PATCH",
     resource: "/conversations/{conversationId}",
+    requestContext: AUTH_CONTEXT,
     pathParameters: { conversationId: "CONV%23telegram%231" },
     body: JSON.stringify({ status: "IN_PROGRESS" }),
   });
@@ -314,6 +326,7 @@ test("filtered GET /conversations paginates bounded pages across empty FilterExp
   const res = await handler({
     httpMethod: "GET",
     resource: "/conversations",
+    requestContext: AUTH_CONTEXT,
     queryStringParameters: { channel: "telegram", limit: "10" },
   });
   assert.equal(res.statusCode, 200);
@@ -321,4 +334,77 @@ test("filtered GET /conversations paginates bounded pages across empty FilterExp
   assert.equal(page, 2);
   assert.equal(body.conversations.length, 1);
   assert.equal(body.nextToken, null);
+});
+
+test("enforces 401 when JWT claims are missing across routes while allowing OPTIONS", async () => {
+  const handler = createHandler({ ddbClient: { async send() { return {}; } } });
+
+  const opt = await handler({ httpMethod: "OPTIONS" });
+  assert.equal(opt.statusCode, 200);
+
+  for (const evt of [
+    { httpMethod: "GET", resource: "/conversations" },
+    { httpMethod: "GET", resource: "/conversations/{conversationId}/messages", pathParameters: { conversationId: "CONV%23telegram%231" } },
+    { httpMethod: "PATCH", resource: "/conversations/{conversationId}", pathParameters: { conversationId: "CONV%23telegram%231" }, body: JSON.stringify({ status: "OPEN" }) },
+    { httpMethod: "POST", resource: "/ws-ticket" },
+  ]) {
+    const res = await handler(evt);
+    assert.equal(res.statusCode, 401);
+  }
+});
+
+test("supports HTTP v2 routeKey, base64 body, >50-char assignedAgent, and skips expired WS ttl", async () => {
+  const sentConnections = [];
+  const longEmail = "customer.support.senior.teamlead.ap.southeast.one@enterprise-omniinbox.example.com";
+  const nowMs = 1732264250000;
+  const nowSec = Math.floor(nowMs / 1000);
+
+  const handler = createHandler({
+    env: { WS_ENDPOINT: "https://ws.example.com/prod" },
+    now: () => nowMs,
+    ddbClient: {
+      async send(cmd) {
+        if (cmd.constructor.name === "UpdateCommand") {
+          return {
+            Attributes: {
+              conversationId: "CONV#telegram#1",
+              assignedAgent: longEmail,
+              status: "IN_PROGRESS",
+            },
+          };
+        }
+        if (cmd.constructor.name === "ScanCommand") {
+          return {
+            Items: [
+              { connectionId: "conn-expired", clientType: "portal", ttl: nowSec - 10 },
+              { connectionId: "conn-active", clientType: "portal", ttl: nowSec + 600 },
+              { connectionId: "conn-no-ttl", clientType: "portal" },
+            ],
+          };
+        }
+        return {};
+      },
+    },
+    createWsClient: () => ({
+      async send(cmd) {
+        sentConnections.push(cmd.input.ConnectionId);
+      },
+    }),
+  });
+
+  const payload = JSON.stringify({ assignedAgent: longEmail, status: "IN_PROGRESS" });
+  const res = await handler({
+    routeKey: "PATCH /conversations/{conversationId}",
+    requestContext: {
+      http: { method: "PATCH" },
+      authorizer: { jwt: { claims: { username: "agent.support@omniinbox.local" } } },
+    },
+    pathParameters: { conversationId: "CONV%23telegram%231" },
+    isBase64Encoded: true,
+    body: Buffer.from(payload, "utf8").toString("base64"),
+  });
+
+  assert.equal(res.statusCode, 200);
+  assert.equal(JSON.parse(res.body).conversation.assignedAgent, longEmail);
+  assert.deepEqual(sentConnections, ["conn-active", "conn-no-ttl"]);
 });

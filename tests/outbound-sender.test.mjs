@@ -400,3 +400,144 @@ test("Telegram WS broadcast skips simulator connections and auto-refreshes SSM t
   assert.equal(getFetchCalls(), 3);
   assert.deepEqual(broadcastTargets, ["conn-portal", "conn-portal"]);
 });
+
+test("in-flight customer message arriving AFTER startedMs keeps customer preview and direction INBOUND", async () => {
+  const convState = {
+    conversationId: "CONV#telegram#678901234",
+    gsi1pk: "CONV",
+    channel: "telegram",
+    lastMessage: "Tin cũ",
+    lastMessageAt: "2024-11-22T08:30:00.000Z",
+    lastMessageId: "MSG#1732264200000#10",
+    lastMessageDirection: "INBOUND",
+    status: "IN_PROGRESS",
+    assignedAgent: "agent.minh@omniinbox.local",
+    unreadCount: 1,
+  };
+  let tick = 0;
+  // Call 1 (startedMs): 08:30:05.000Z; Call 2 (nowIso after Telegram latency): 08:30:08.000Z
+  const timestamps = [1732264205000, 1732264208000, 1732264208000];
+  let convFallbackUpdateAttempted = false;
+
+  const handler = createHandler({
+    now: () => timestamps[Math.min(tick++, timestamps.length - 1)],
+    randomUUID: () => "11111111-1111-1111-1111-111111111111",
+    ddbClient: {
+      async send(cmd) {
+        const name = cmd.constructor.name;
+        if (name === "GetCommand") {
+          if (cmd.input.TableName === "OmniConversations") return { Item: { ...convState } };
+          return {};
+        }
+        if (name === "PutCommand") return {};
+        if (name === "UpdateCommand") {
+          if (cmd.input.TableName === "OmniMessages") {
+            return { Attributes: { messageId: cmd.input.Key.messageId, status: "SENT", channel: "telegram" } };
+          }
+          const cond = cmd.input.ConditionExpression || "";
+          if (cond.includes("lastMessageAt = :prevLma")) {
+            // Simulate customer sending a newer message at 08:30:06.000Z while Telegram was in flight
+            convState.lastMessage = "Khách hỏi thêm sau 1 giây";
+            convState.lastMessageAt = "2024-11-22T08:30:06.000Z";
+            convState.lastMessageDirection = "INBOUND";
+            convState.unreadCount = 2;
+            const err = new Error("Conditional check failed");
+            err.name = "ConditionalCheckFailedException";
+            throw err;
+          }
+          convFallbackUpdateAttempted = true;
+          return { Attributes: { ...convState } };
+        }
+        return {};
+      },
+    },
+    ssmClient: {
+      async send() {
+        return { Parameter: { Value: "token-1" } };
+      },
+    },
+    fetch: async () => ({ json: async () => ({ ok: true }) }),
+  });
+
+  const res = await handler({
+    httpMethod: "POST",
+    requestContext: { authorizer: { claims: { email: "agent.minh@omniinbox.local" } } },
+    body: JSON.stringify({ conversationId: "CONV#telegram#678901234", content: "Shop trả lời" }),
+  });
+
+  assert.equal(res.statusCode, 200);
+  const body = JSON.parse(res.body);
+  assert.equal(convFallbackUpdateAttempted, false);
+  assert.equal(body.conversation.lastMessage, "Khách hỏi thêm sau 1 giây");
+  assert.equal(body.conversation.lastMessageDirection, "INBOUND");
+  assert.equal(body.conversation.unreadCount, 2);
+});
+
+test("supports base64 body, conversation without lastMessageAt, and skips expired WS ttl", async () => {
+  const convState = {
+    conversationId: "CONV#shopee#u_new",
+    channel: "shopee",
+    status: "OPEN",
+    assignedAgent: "agent.minh@omniinbox.local",
+    unreadCount: 1,
+  };
+  const sentTargets = [];
+  const nowMs = 1732264250000;
+  const nowSec = Math.floor(nowMs / 1000);
+
+  const handler = createHandler({
+    env: { WS_ENDPOINT: "https://ws.example.com/prod" },
+    now: () => nowMs,
+    randomUUID: () => "22222222-2222-2222-2222-222222222222",
+    ddbClient: {
+      async send(cmd) {
+        const name = cmd.constructor.name;
+        if (name === "GetCommand") {
+          if (cmd.input.TableName === "OmniConversations") return { Item: { ...convState } };
+          return {};
+        }
+        if (name === "PutCommand") return {};
+        if (name === "UpdateCommand") {
+          if (cmd.input.TableName === "OmniMessages") {
+            return { Attributes: { messageId: cmd.input.Key.messageId, status: "SENT", channel: "shopee" } };
+          }
+          const vals = cmd.input.ExpressionAttributeValues || {};
+          if (vals[":zero"] === 0) convState.unreadCount = 0;
+          if (vals[":lm"]) convState.lastMessage = vals[":lm"];
+          if (vals[":lma"]) convState.lastMessageAt = vals[":lma"];
+          if (vals[":dir"]) convState.lastMessageDirection = vals[":dir"];
+          if (vals[":inProgress"]) convState.status = vals[":inProgress"];
+          return { Attributes: { ...convState } };
+        }
+        if (name === "ScanCommand") {
+          return {
+            Items: [
+              { connectionId: "conn-expired", clientType: "portal", ttl: nowSec - 1 },
+              { connectionId: "conn-live", clientType: "simulator", ttl: nowSec + 100 },
+            ],
+          };
+        }
+        return {};
+      },
+    },
+    createWsClient: () => ({
+      async send(cmd) {
+        sentTargets.push(cmd.input.ConnectionId);
+      },
+    }),
+  });
+
+  const bodyStr = JSON.stringify({ conversationId: "CONV#shopee#u_new", content: "Chào bạn" });
+  const res = await handler({
+    httpMethod: "POST",
+    requestContext: { authorizer: { claims: { username: "agent.minh@omniinbox.local" } } },
+    isBase64Encoded: true,
+    body: Buffer.from(bodyStr, "utf8").toString("base64"),
+  });
+
+  assert.equal(res.statusCode, 200);
+  const body = JSON.parse(res.body);
+  assert.equal(body.conversation.status, "IN_PROGRESS");
+  assert.equal(body.conversation.unreadCount, 0);
+  assert.deepEqual(sentTargets, ["conn-live"]);
+});

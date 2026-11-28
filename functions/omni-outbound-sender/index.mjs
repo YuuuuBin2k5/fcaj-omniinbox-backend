@@ -31,7 +31,7 @@ export function resolveAgentId(claims = {}) {
   const username = claims["cognito:username"];
   const email = claims.email;
   if (username && !UUID_RE.test(username)) return username;
-  return email || username || null;
+  return email || username || claims.username || claims.sub || null;
 }
 
 const publicConversation = (item) => {
@@ -95,6 +95,7 @@ export function createHandler(deps = {}) {
     try {
       wsClient ??= createWsClient(WS_ENDPOINT);
       const isTelegram = payload?.message?.channel === "telegram";
+      const nowSec = Math.floor(now() / 1000);
       const connections = [];
       let lastKey;
       do {
@@ -104,6 +105,8 @@ export function createHandler(deps = {}) {
         for (const item of res.Items || []) {
           // Không đẩy tin outbound Telegram thật xuống kết nối WebSocket của Simulator
           if (isTelegram && item.clientType === "simulator") continue;
+          // Bỏ qua kết nối đã quá hạn TTL vì DynamoDB có thể xóa chậm
+          if (Number.isFinite(item.ttl) && item.ttl <= nowSec) continue;
           connections.push(item);
         }
         lastKey = res.LastEvaluatedKey;
@@ -123,6 +126,8 @@ export function createHandler(deps = {}) {
               err.$metadata?.httpStatusCode === 410
             ) {
               await ddb.send(new DeleteCommand({ TableName: CONN_TABLE, Key: { connectionId } }));
+            } else {
+              console.warn(`Broadcast to ${connectionId} failed:`, err.message);
             }
           }
         })
@@ -184,9 +189,12 @@ export function createHandler(deps = {}) {
       const agentId = resolveAgentId(getClaims(event));
       if (!agentId) return respond(401, { error: "Unauthorized" });
 
+      const rawBody = event.isBase64Encoded
+        ? Buffer.from(event.body || "", "base64").toString("utf8")
+        : event.body || "";
       let body;
       try {
-        body = event.body ? JSON.parse(event.body) : {};
+        body = rawBody ? JSON.parse(rawBody) : {};
       } catch {
         return respond(400, { error: "Invalid JSON" });
       }
@@ -368,17 +376,24 @@ export function createHandler(deps = {}) {
       );
 
       // Chỉ xóa unreadCount khi gửi thành công và không có tin inbound mới đến trong lúc đang gửi
+      // Dùng chính message.createdAt để tin khách đến sau startedMs không bị ghi đè ngược khi Telegram trả chậm
+      const outboundCreatedAt = message.createdAt;
       let latestConv = conv;
       try {
         if (status === "SENT") {
           const sets = ["unreadCount = :zero"];
-          const values = { ":zero": 0, ":prevLma": conv.lastMessageAt };
+          const values = { ":zero": 0 };
+          const prevLmaCond =
+            conv.lastMessageAt === undefined
+              ? "attribute_not_exists(lastMessageAt)"
+              : "lastMessageAt = :prevLma";
+          if (conv.lastMessageAt !== undefined) values[":prevLma"] = conv.lastMessageAt;
           const sameMessage =
             conv.lastMessageId === undefined
               ? "attribute_not_exists(lastMessageId)"
               : "lastMessageId = :prevId";
           if (conv.lastMessageId !== undefined) values[":prevId"] = conv.lastMessageId;
-          if (!existing && (!conv.lastMessageAt || nowIso > conv.lastMessageAt)) {
+          if (!existing && (!conv.lastMessageAt || outboundCreatedAt > conv.lastMessageAt)) {
             sets.push(
               "lastMessage = :lm",
               "lastMessageAt = :lma",
@@ -387,7 +402,7 @@ export function createHandler(deps = {}) {
             );
             values[":lid"] = outboundMsg.messageId;
             values[":lm"] = `[NV] ${content}`.slice(0, 200);
-            values[":lma"] = nowIso;
+            values[":lma"] = outboundCreatedAt;
             values[":dir"] = "OUTBOUND";
           }
 
@@ -397,7 +412,7 @@ export function createHandler(deps = {}) {
                 TableName: CONV_TABLE,
                 Key: { conversationId },
                 UpdateExpression: `SET ${sets.join(", ")}`,
-                ConditionExpression: `attribute_exists(conversationId) AND lastMessageAt = :prevLma AND ${sameMessage}`,
+                ConditionExpression: `attribute_exists(conversationId) AND ${prevLmaCond} AND ${sameMessage}`,
                 ExpressionAttributeValues: values,
                 ReturnValues: "ALL_NEW",
               })
@@ -412,18 +427,21 @@ export function createHandler(deps = {}) {
             if (!currentConv) throw new Error("Conversation no longer exists");
             latestConv = currentConv;
 
-            // Có tin inbound mới đến lúc đang gửi nên chỉ cập nhật xem trước, giữ nguyên unreadCount
-            if (!existing && currentConv.lastMessageAt < nowIso) {
+            // Có tin inbound mới đến lúc đang gửi nên chỉ cập nhật xem trước khi outbound mới hơn, giữ nguyên unreadCount
+            if (
+              !existing &&
+              (!currentConv.lastMessageAt || currentConv.lastMessageAt < outboundCreatedAt)
+            ) {
               const res = await ddb.send(
                 new UpdateCommand({
                   TableName: CONV_TABLE,
                   Key: { conversationId },
                   UpdateExpression:
                     "SET lastMessage = :lm, lastMessageAt = :lma, lastMessageId = :lid, lastMessageDirection = :dir",
-                  ConditionExpression: "lastMessageAt < :lma",
+                  ConditionExpression: "attribute_not_exists(lastMessageAt) OR lastMessageAt < :lma",
                   ExpressionAttributeValues: {
                     ":lm": `[NV] ${content}`.slice(0, 200),
-                    ":lma": nowIso,
+                    ":lma": outboundCreatedAt,
                     ":lid": outboundMsg.messageId,
                     ":dir": "OUTBOUND",
                   },

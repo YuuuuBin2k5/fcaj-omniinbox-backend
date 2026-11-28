@@ -416,3 +416,41 @@ test("uses 20s STALE_LOCK_MS and skips simulator-only WS connections during broa
   assert.equal(calls.put[0].ExpressionAttributeValues[":staleBefore"], nowMs - 20_000);
   assert.deepEqual(delivered, ["conn-portal"]);
 });
+
+test("skips expired ttl WS connections during broadcast", async () => {
+  const delivered = [];
+  const nowMs = 1732264250000;
+  const nowSec = Math.floor(nowMs / 1000);
+  const { ddbClient } = createNormalizerDdbMock({
+    connections: [
+      { connectionId: "conn-expired", clientType: "portal", ttl: nowSec - 5 },
+      { connectionId: "conn-active", clientType: "portal", ttl: nowSec + 120 },
+    ],
+  });
+
+  const handler = createHandler({
+    env: { WS_ENDPOINT: "https://ws.example.com/prod" },
+    ddbClient,
+    now: () => nowMs,
+    createWsClient: () => ({
+      async send(cmd) {
+        delivered.push(cmd.input.ConnectionId);
+      },
+    }),
+  });
+
+  await handler({
+    Records: [
+      {
+        messageId: "rec-ttl-filter",
+        body: JSON.stringify({
+          channel: "telegram",
+          receivedAt: new Date(nowMs).toISOString(),
+          payload: telegramFixture,
+        }),
+      },
+    ],
+  });
+
+  assert.deepEqual(delivered, ["conn-active"]);
+});
